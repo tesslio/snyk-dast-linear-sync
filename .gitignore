@@ -30,3 +30,19 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Tool-specific: sync cache and run logs
+.tmp/
+data/
+logs/
+
+# Built binaries
+/snyk-dast-linear-sync
+/investigate-duedate
+
+# macOS
+.DS_Store
+
+# Bots suggesting commit messages
+COMMIT_MSG
+COMMIT_MSG.md

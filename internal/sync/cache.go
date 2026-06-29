@@ -1,0 +1,114 @@
+package sync
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/RichardoC/snyk-dast-linear-sync/internal/model"
+)
+
+const metadataSchemaVersion = "2026-06-26-snyk-dast-sync-cache-v1"
+
+func managedSchemaSignature() string {
+	return metadataSchemaVersion
+}
+
+func desiredIssueHash(desired model.DesiredIssue) string {
+	statePart := string(desired.State)
+	if desired.PreserveState {
+		statePart += ":preserve"
+	}
+	// Use DueDateBase (raw SLA date) instead of DueDate (floored) for cache
+	// stability. The floor-to-today adjustment changes daily, which would
+	// cause the source hash to churn for overdue issues even when the
+	// underlying finding data has not changed.
+	dueDateForHash := desired.DueDateBase
+	if dueDateForHash == "" {
+		dueDateForHash = desired.DueDate
+	}
+	return digestParts(
+		desired.Fingerprint,
+		desired.Title,
+		normalizeDescriptionForCompare(desired.Description),
+		dueDateForHash,
+		statePart,
+		strings.Join(model.NormalizeManagedLabelNames(desired.ManagedLabels), ","),
+		fmt.Sprintf("%d", desired.Priority),
+	)
+}
+
+func existingIssueHash(existing model.ExistingIssue) string {
+	return digestParts(
+		existing.Fingerprint,
+		existing.Title,
+		normalizeDescriptionForCompare(existing.Description),
+		existing.DueDate,
+		model.NormalizeWorkflowStateName(existing.StateName),
+		strings.Join(model.NormalizeManagedLabelNames(existing.ManagedLabels), ","),
+		strings.Join(presentManagedLabelNames(existing.Labels, existing.ManagedLabels), ","),
+		fmt.Sprintf("%d", existing.Priority),
+	)
+}
+
+func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existingByFingerprint map[string]model.ExistingIssue, conflicted map[string]struct{}) map[string]string {
+	out := make(map[string]string, len(existingByFingerprint)+len(desiredByFingerprint))
+
+	for fingerprint, desired := range desiredByFingerprint {
+		if _, blocked := conflicted[fingerprint]; blocked {
+			continue
+		}
+		existing, ok := existingByFingerprint[fingerprint]
+		if ok && !needsUpdate(existing, desired) {
+			out[fingerprint] = existingIssueHash(existing)
+			continue
+		}
+		out[fingerprint] = desiredIssueHash(desired)
+	}
+
+	for fingerprint, existing := range existingByFingerprint {
+		if _, blocked := conflicted[fingerprint]; blocked {
+			continue
+		}
+		if _, ok := desiredByFingerprint[fingerprint]; ok {
+			continue
+		}
+
+		resolved := model.DesiredIssue{
+			Fingerprint:   existing.Fingerprint,
+			Title:         existing.Title,
+			Description:   existing.Description,
+			DueDate:       existing.DueDate,
+			State:         model.StateDone,
+			ManagedLabels: existing.ManagedLabels,
+			Priority:      existing.Priority,
+		}
+		if needsUpdate(existing, resolved) {
+			out[fingerprint] = desiredIssueHash(resolved)
+			continue
+		}
+		out[fingerprint] = existingIssueHash(existing)
+	}
+
+	return out
+}
+
+func digestParts(parts ...string) string {
+	h := sha256.New()
+	for _, part := range parts {
+		_, _ = h.Write([]byte(part))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func presentManagedLabelNames(labels []model.IssueLabel, managed []string) []string {
+	out := make([]string, 0, len(managed))
+	for _, label := range model.NormalizeManagedLabelNames(managed) {
+		if model.HasLabelNamed(labels, label) {
+			out = append(out, label)
+		}
+	}
+	return out
+}

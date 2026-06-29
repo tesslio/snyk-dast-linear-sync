@@ -1,0 +1,311 @@
+# Project Overview
+
+## Purpose
+
+This project exists to keep Linear aligned with Snyk DAST.
+
+Canonical module path:
+
+```text
+github.com/RichardoC/snyk-dast-linear-sync
+```
+
+Snyk DAST is the rebrand of Probely. The tool talks to the Probely REST API
+(current hostnames `api.probely.com` / `app.probely.com`, both configurable)
+and is forward-compatible with the Snyk DAST rebrand.
+
+The intended outcome is:
+
+- every relevant Snyk DAST finding has a corresponding Linear issue
+- the Linear issue stays current as the Snyk DAST finding changes
+- resolved or accepted/invalidated findings move to the correct Linear workflow state
+- repeated runs become cheap by skipping unchanged records
+
+This is an operational sync tool, not a generic library.
+
+## Core Contract
+
+The project treats Snyk DAST as the source of truth for security finding data
+and Linear as the execution surface for tracking and triage.
+
+It is responsible for:
+
+- reading Snyk DAST findings (and the targets they belong to)
+- deciding the desired Linear representation
+- reconciling the current Linear state to that desired state
+
+It is not responsible for:
+
+- writing back to Snyk DAST
+- preserving arbitrary manual edits inside the managed section of the Linear description
+- syncing comments or custom fields beyond the currently managed issue body, title, priority, due date, workflow state, and managed automation label
+
+## Identity Model
+
+Each Snyk DAST finding is identified by:
+
+```text
+snyk-dast:<target-id>:<finding-id>
+```
+
+The `<finding-id>` is the bare numeric finding id returned by the Snyk DAST
+API (the `id` field from `GET /findings/`). Global uniqueness comes from the
+`snyk-dast:<target-id>:` prefix. That fingerprint is embedded in the Linear
+description metadata block and is the durable join key between systems.
+
+Without that fingerprint, the sync cannot safely deduplicate or update issues.
+
+## Issue Lifecycle
+
+### Create
+
+Create a Linear issue when:
+
+- a Snyk DAST finding exists
+- no Linear issue with the same fingerprint exists
+
+### Update
+
+Update the Linear issue when managed fields differ:
+
+- title
+- description
+- due date
+- priority
+- mapped state
+- managed automation label
+
+### Resolve
+
+When a previously tracked finding no longer exists in Snyk DAST but its target
+still exists, move the Linear issue to the resolved (`Done`) state.
+
+When a previously tracked finding no longer exists because its Snyk DAST target
+no longer exists, cancel the Linear issue instead.
+
+### Conflict
+
+If multiple Linear issues share the same fingerprint, the sync treats that as a
+conflict:
+
+- it logs the conflict
+- it keeps the lowest-identifier issue as canonical and cancels the duplicates
+
+## Description Strategy
+
+The Linear issue description is intentionally structured for fast triage first,
+deep debugging second. Snyk DAST is a DAST product, so findings describe
+vulnerabilities in a scanned web application or API target rather than
+source-code locations or package dependencies.
+
+It includes:
+
+- heading with vulnerability title and severity
+- target name/host and target URL near the top
+- the vulnerable request context: URL, HTTP method, path, parameter, insertion point
+- CWE and CVSS score when available
+- human-usable Snyk DAST UI link
+- Snyk DAST REST API link
+- the fix description when Snyk DAST provides one
+- target and finding identifiers
+- metadata block
+
+The synced title is also structured for scanability. It leads with the scanned
+target (host, falling back to target name) and the vulnerable request
+(`METHOD path`).
+
+The metadata block also records the managed automation label set when label
+management is enabled.
+
+Linear may rewrite parts of the description body when rendering or storing
+markdown. The sync therefore normalizes known Linear formatting changes during
+compare and cache hashing.
+
+## Managed Labels
+
+`LINEAR_MANAGED_LABEL` controls the label this tool manages on synced issues.
+
+- default: `snyk-dast-automation`
+- `off`: disables label management
+- any other value: the exact Linear label name to manage
+
+Behavior:
+
+- the configured managed label is added to new synced issues
+- unrelated existing labels are preserved
+- if the configured managed label changes, the old managed label is removed and the new one is applied
+- if label management is disabled, the previously managed label is removed
+
+The configured label must already exist in Linear. If it does not, the run
+fails with a clear operator-facing error.
+
+`LINEAR_TARGET_TYPE_LABELS` optionally maps Snyk DAST target `type` values
+(`single` for web applications, `api` for APIs) to additional managed Linear
+labels.
+
+- format: comma-separated `target_type:label` pairs
+- example: `api:snyk-dast-api,single:snyk-dast-web`
+
+`LINEAR_TARGET_TYPE_LABEL_DEFAULT` controls the fallback label for unmapped
+target types.
+
+- default: `off`
+- `off`: disables the fallback
+
+The metadata block stores the full managed label set so the sync can remove
+stale target-type-derived labels while preserving unrelated manual labels.
+
+`LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification
+behavior.
+
+- default: `true`
+- when enabled, the sync creates issues without subscribing the Linear API actor
+- update operations preserve the current subscriber list exactly as it already exists
+
+## State Mapping
+
+Snyk DAST (Probely) finding states map to Linear workflow states as follows:
+
+- `notfixed` / `retesting` -> `Todo`
+- `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
+- `accepted` without (or past) `expiration_date` (permanent risk acceptance) -> `Cancelled`
+- `invalid` (false positive) -> `Cancelled`
+- `fixed` -> `Done`
+- missing finding in an existing Snyk DAST target -> `Done`
+- missing finding because the Snyk DAST target no longer exists -> `Cancelled`
+
+The sync also normalizes workflow naming differences such as `Canceled` vs
+`Cancelled`.
+
+A time-limited `accepted` finding is kept open in `Todo` rather than cancelled,
+because it requires attention once the acceptance expires. Its due date is
+calculated from the acceptance expiry date so the SLA extends to the normal
+severity offset from when the acceptance ends.
+
+### Manual Non-Terminal State Override
+
+When a user manually moves a managed issue to any non-terminal Linear workflow
+state that differs from what the sync would set, subsequent syncs preserve the
+user's chosen state. This prevents the automation from fighting intentional
+triage decisions.
+
+This covers:
+
+- a user moving an open issue from the configured open state (e.g. `Triage`) to `Todo` or `In Progress`
+- a user moving a snoozed issue from `Backlog` to `Todo`
+- any other non-terminal state that differs from the configured state for the desired model state
+
+Terminal states (`Done`, `Cancelled`) are never preserved: the sync always
+transitions to a terminal state when the Snyk DAST finding is fixed or
+permanently accepted/invalidated, even if a user manually moved the issue to a
+terminal state.
+
+### Due Dates
+
+Due dates are derived from the Snyk DAST finding `created_at` timestamp, not
+from when the issue first appears in Linear. For time-limited `accepted`
+findings (snoozed), the due date is instead calculated from the acceptance
+expiry date so the SLA extends to the normal severity offset from when the
+acceptance expires.
+
+Default offsets:
+
+- critical: 15 days
+- high: 30 days
+- medium: 45 days
+- low: 90 days
+
+Past due dates are left as-is. Linear renders past due dates as "overdue", and
+the actual past date is more informative than flooring to today: it tells the
+triager how long the issue has been past its SLA. Flooring to today would also
+cause daily cache churn.
+
+## Performance Model
+
+The project is designed for thousands of issues.
+
+It uses:
+
+- concurrent Snyk DAST and Linear snapshot loading
+- worker-based reconciliation
+- batched Linear mutations
+- rate-limit backoff
+- SQLite caching
+
+The cache is critical for steady-state performance. A healthy steady-state run
+should do little or no work when nothing has changed.
+
+## SQLite Cache
+
+The SQLite cache stores:
+
+- Snyk DAST-side normalized hashes keyed by fingerprint
+- Linear-side normalized hashes keyed by fingerprint
+- a schema signature for the managed issue format
+
+The cache is used only as an optimization. It should never be the only source
+used to infer real current state.
+
+Normal behavior:
+
+1. Read live Snyk DAST data.
+2. Read live Linear data.
+3. Compare both against the last successful cached hashes.
+4. Skip unchanged fingerprints.
+5. After successful writes, refresh the cache from the live post-write Linear snapshot.
+
+The post-write refresh matters because Linear may rewrite markdown bodies after
+mutation.
+
+The cache fast-path never suppresses a pending move into a terminal state
+(`Done`/`Cancelled`): a finding that became fixed or permanently
+accepted/invalidated while its ticket sat in an open column must still be
+closed, even if its hashes are unchanged since the last run.
+
+## Safety Assumptions
+
+- The metadata block must remain intact.
+- The managed description body is owned by this tool.
+- Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
+- Cache bypass is the correct operator action when the rendering schema or compare logic changes.
+
+## Operator Guidance
+
+After any code change, run:
+
+```bash
+go fix ./...
+go test ./...
+go vet ./...
+```
+
+Use a normal run for day-to-day sync:
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env
+```
+
+Use a dry run to inspect planned changes:
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env --dry-run
+```
+
+Use cache bypass when you intentionally changed the managed rendering or need a
+full live reconciliation:
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env --bypass-cache
+```
+
+## Design Boundaries
+
+If this project grows further, the next reasonable extensions would be:
+
+- richer incremental Snyk DAST fetching using server timestamps where available
+- more selective Linear snapshot loading if the API surface allows it safely
+- richer cache statistics and observability
+- explicit conflict reporting output
+
+The current implementation is intentionally optimized for correctness first,
+then steady-state efficiency.
