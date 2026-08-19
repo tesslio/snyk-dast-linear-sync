@@ -263,7 +263,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` -> `Todo` (SLA from acceptance expiry)
-- `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; SLA from acceptance expiry, so the issue is due immediately)
+- `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; SLA from acceptance expiry, so the issue is due immediately). A date-only `expiration_date` covers the whole of that day, so the acceptance lapses at the end of it, not at midnight.
 - `accepted` without an `expiration_date` -> `Cancelled`
 - `invalid` -> `Cancelled`
 - `fixed` -> `Done`

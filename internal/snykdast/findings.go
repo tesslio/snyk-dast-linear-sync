@@ -522,9 +522,9 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 		return model.FindingIgnored, time.Time{}
 	case "accepted":
 		if expirationDate != nil {
-			expires, ok := parseExpirationDate(*expirationDate)
+			expires, activeUntil, ok := parseExpirationDate(*expirationDate)
 			if ok {
-				if time.Now().Before(expires) {
+				if time.Now().Before(activeUntil) {
 					// Acceptance still in force: track the finding but do not
 					// treat it as needing attention yet.
 					return model.FindingSnoozed, expires
@@ -548,19 +548,28 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 // parseExpirationDate parses a Snyk DAST acceptance expiry. The API documents a
 // plain date, but a full RFC3339 timestamp is accepted too so that a format
 // change upstream does not silently turn every time-limited acceptance into a
-// permanent one. A date-only value is interpreted as midnight UTC, so an
-// acceptance expires at the start of its expiry day.
-func parseExpirationDate(raw string) (time.Time, bool) {
+// permanent one.
+//
+// It returns two instants. expires is the expiry as written, and is what the
+// SLA due date is measured from. activeUntil is the instant the acceptance
+// actually stops applying, and is what "has it lapsed?" must be compared
+// against. They differ for a date-only value: an expiry of 2026-08-19 means the
+// acceptance covers all of the 19th, so it lapses at the END of that day.
+// Comparing against midnight instead would expire the acceptance a day early,
+// pulling the finding back into triage while the team still considers it
+// accepted. An RFC3339 value carries its own time, so the two coincide.
+func parseExpirationDate(raw string) (expires, activeUntil time.Time, ok bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return time.Time{}, false
+		return time.Time{}, time.Time{}, false
 	}
-	for _, layout := range []string{time.DateOnly, time.RFC3339} {
-		if parsed, err := time.Parse(layout, raw); err == nil && !parsed.IsZero() {
-			return parsed, true
-		}
+	if parsed, err := time.Parse(time.DateOnly, raw); err == nil && !parsed.IsZero() {
+		return parsed, parsed.AddDate(0, 0, 1), true
 	}
-	return time.Time{}, false
+	if parsed, err := time.Parse(time.RFC3339, raw); err == nil && !parsed.IsZero() {
+		return parsed, parsed, true
+	}
+	return time.Time{}, time.Time{}, false
 }
 
 func mapSeverity(code int) string {
