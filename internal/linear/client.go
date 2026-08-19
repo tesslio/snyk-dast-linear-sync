@@ -14,9 +14,9 @@ import (
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 	linearapi "github.com/guillermo/linear/linear-api"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/httpx"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/model"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/httpx"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
 const (

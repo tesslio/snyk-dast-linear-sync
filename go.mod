@@ -1,4 +1,4 @@
-module github.com/RichardoC/snyk-dast-linear-sync
+module github.com/tesslio/snyk-dast-linear-sync
 
 go 1.26.0
 

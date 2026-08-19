@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/model"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
 func TestDiagnoseDueDateExposesCreationAndAcceptanceExpiryScenarios(t *testing.T) {

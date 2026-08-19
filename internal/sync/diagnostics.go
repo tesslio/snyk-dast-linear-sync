@@ -3,8 +3,8 @@ package sync
 import (
 	"time"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/model"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
 // DueDateScenario describes one possible due date computation for a finding.

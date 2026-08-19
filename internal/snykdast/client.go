@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/httpx"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/httpx"
 )
 
 // Client talks to the Snyk DAST REST API. Snyk DAST uses token-based

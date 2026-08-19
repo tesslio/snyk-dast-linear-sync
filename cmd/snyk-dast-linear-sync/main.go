@@ -7,12 +7,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/config"
-	linearclient "github.com/RichardoC/snyk-dast-linear-sync/internal/linear"
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/logx"
-	snykdastclient "github.com/RichardoC/snyk-dast-linear-sync/internal/snykdast"
-	syncsvc "github.com/RichardoC/snyk-dast-linear-sync/internal/sync"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	linearclient "github.com/tesslio/snyk-dast-linear-sync/internal/linear"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/logx"
+	snykdastclient "github.com/tesslio/snyk-dast-linear-sync/internal/snykdast"
+	syncsvc "github.com/tesslio/snyk-dast-linear-sync/internal/sync"
 )
 
 func main() {
