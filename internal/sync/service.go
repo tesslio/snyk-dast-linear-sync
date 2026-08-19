@@ -404,6 +404,43 @@ type job struct {
 	updateBatch  []model.IssueUpdate
 }
 
+// createOne retries a single issue create. A per-entry failure reported through
+// the failed-index return is treated exactly like an error: the issue does not
+// exist either way, so the run must not count it as done. Ignoring the indices
+// here would let a failed retry pass silently and the run report success for
+// work that never landed.
+func (s *Service) createOne(ctx context.Context, desired model.DesiredIssue) error {
+	failed, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired})
+	if err != nil {
+		return err
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("Linear reported the create as failed without returning an error")
+	}
+	return nil
+}
+
+// commentOne retries a single change comment, with the same reasoning as
+// createOne.
+func (s *Service) commentOne(ctx context.Context, update model.IssueUpdate) error {
+	failed, err := s.linear.PostComments(ctx, []model.IssueUpdate{update})
+	if err != nil {
+		return err
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("Linear reported the comment as failed without returning an error")
+	}
+	return nil
+}
+
+// inRange guards indexing by a failed-index list. The Linear client derives the
+// indices from the slice it was handed, so they are always valid in practice,
+// but LinearClient is an interface and an out-of-range index would panic the
+// worker rather than fail one entry.
+func inRange(idx, length int) bool {
+	return idx >= 0 && idx < length
+}
+
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) error {
 	switch job.kind {
 	case jobCreateBatch:
@@ -435,7 +472,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				slog.Any("error", err),
 			)
 			for _, desired := range job.desiredBatch {
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+				if err := s.createOne(ctx, desired); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
@@ -451,8 +488,16 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				slog.Int("batch_size", len(job.desiredBatch)),
 			)
 			for _, idx := range failedIdx {
+				if !inRange(idx, len(job.desiredBatch)) {
+					atomic.AddInt64(&result.FailedOps, 1)
+					s.logger.Error("Linear client reported an out-of-range failed create index",
+						slog.Int("index", idx),
+						slog.Int("batch_size", len(job.desiredBatch)),
+					)
+					continue
+				}
 				desired := job.desiredBatch[idx]
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+				if err := s.createOne(ctx, desired); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
@@ -505,7 +550,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					slog.Any("error", err),
 				)
 				for _, update := range job.updateBatch {
-					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+					if err := s.commentOne(ctx, update); err != nil {
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),
@@ -521,8 +566,15 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					slog.Int("batch_size", len(job.updateBatch)),
 				)
 				for _, idx := range failedIdx {
+					if !inRange(idx, len(job.updateBatch)) {
+						s.logger.Warn("Linear client reported an out-of-range failed comment index",
+							slog.Int("index", idx),
+							slog.Int("batch_size", len(job.updateBatch)),
+						)
+						continue
+					}
 					update := job.updateBatch[idx]
-					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+					if err := s.commentOne(ctx, update); err != nil {
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),

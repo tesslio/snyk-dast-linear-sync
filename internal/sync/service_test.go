@@ -35,6 +35,9 @@ type fakeLinear struct {
 	createFailIdx  []int
 	commentFailIdx []int
 	createCalls    []int
+	// createAlwaysFailIdx makes every create call report a per-entry failure,
+	// including single-entry retries.
+	createAlwaysFailIdx bool
 }
 
 type fakeCache struct {
@@ -48,6 +51,15 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 
 func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
 	f.created = append(f.created, desired...)
+	if f.createAlwaysFailIdx {
+		// Every call, retries included, reports a per-entry failure with a nil
+		// error — the case that used to be silently dropped.
+		failed := make([]int, len(desired))
+		for i := range desired {
+			failed[i] = i
+		}
+		return failed, nil
+	}
 	if f.createFailIdx != nil {
 		f.createCalls = append(f.createCalls, len(desired))
 		failed := f.createFailIdx
@@ -1860,5 +1872,38 @@ func TestPreferCanonicalDuplicatePrefersLiveTicket(t *testing.T) {
 	canonical, duplicate = preferCanonicalDuplicate(a, b, states)
 	if canonical.Identifier != "SEC-2" || duplicate.Identifier != "SEC-4" {
 		t.Fatalf("canonical = %q, duplicate = %q; want SEC-2 canonical", canonical.Identifier, duplicate.Identifier)
+	}
+}
+
+// TestRunCountsRetryFailuresReportedWithoutError guards the accounting hole
+// CodeRabbit flagged: the batch client reports per-entry failures through a
+// failed-index return with a nil error, so a retry loop that inspects only the
+// error value counts a failed create as done and the run reports success for an
+// issue that was never created.
+func TestRunCountsRetryFailuresReportedWithoutError(t *testing.T) {
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       "snyk-dast:target-a:finding-1",
+					SnykDASTFindingID: "su2d3k-1",
+					TargetID:          "target-a",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+				},
+			},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	linear := &fakeLinear{createAlwaysFailIdx: true}
+
+	result, err := New(baseTestConfig(), discardLogger(), snykdast, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1: a create that failed without an error must still be counted", result.FailedOps)
 	}
 }

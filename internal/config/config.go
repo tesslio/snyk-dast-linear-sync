@@ -48,7 +48,7 @@ const (
 	// entire archived backlog, which is why the default is effectively
 	// unbounded. It stays configurable purely as a size/latency escape hatch:
 	// lowering it trades duplicate-freedom for a smaller snapshot on each run.
-	defaultArchiveLookbackDays = 3650
+	defaultArchiveLookbackDays = DefaultArchiveLookbackDays
 
 	// maxArchiveLookbackDays is the largest value that survives conversion to a
 	// 24-hour time.Duration. math.MaxInt64 nanoseconds is ~106751.99 days, so a
@@ -57,6 +57,10 @@ const (
 	// duplicate-creation bug straight back.
 	maxArchiveLookbackDays = 106751
 )
+
+// DefaultArchiveLookbackDays is the default archive lookback window, exported so
+// the Linear client's defensive fallback cannot drift from the config default.
+const DefaultArchiveLookbackDays = 3650
 
 type Config struct {
 	DryRun  bool
