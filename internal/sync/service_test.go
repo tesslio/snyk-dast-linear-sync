@@ -1947,9 +1947,12 @@ func TestRunCountsRetryFailuresReportedWithoutError(t *testing.T) {
 func threeOpenFindings() fakeSnykDAST {
 	var findings []model.Finding
 	for i := 1; i <= 3; i++ {
+		findingID := fmt.Sprintf("su2d3k-%d", i)
 		findings = append(findings, model.Finding{
-			Fingerprint:       fmt.Sprintf("snyk-dast:target-a:finding-%d", i),
-			SnykDASTFindingID: fmt.Sprintf("su2d3k-%d", i),
+			// Derive the fingerprint the same way the production path does, so the
+			// fixture keys match what the service looks up.
+			Fingerprint:       model.Fingerprint("target-a", findingID),
+			SnykDASTFindingID: findingID,
 			TargetID:          "target-a",
 			IssueTitle:        "Reflected XSS",
 			Severity:          "high",
@@ -1973,8 +1976,8 @@ func TestRunReconcilesAmbiguousBatchCreateBeforeRetry(t *testing.T) {
 		createBatchErr: errors.New("connection reset by peer"),
 		// Two of the three creates were committed before the response was lost.
 		landedFingerprints: []string{
-			"snyk-dast:target-a:finding-1",
-			"snyk-dast:target-a:finding-3",
+			model.Fingerprint("target-a", "su2d3k-1"),
+			model.Fingerprint("target-a", "su2d3k-3"),
 		},
 	}
 
@@ -1989,8 +1992,8 @@ func TestRunReconcilesAmbiguousBatchCreateBeforeRetry(t *testing.T) {
 		t.Fatalf("created = %d (%#v), want 1: only the entry that did not land may be recreated",
 			len(linear.created), desiredFingerprints(linear.created))
 	}
-	if linear.created[0].Fingerprint != "snyk-dast:target-a:finding-2" {
-		t.Fatalf("recreated %q, want the un-landed finding-2", linear.created[0].Fingerprint)
+	if want := model.Fingerprint("target-a", "su2d3k-2"); linear.created[0].Fingerprint != want {
+		t.Fatalf("recreated %q, want the un-landed %q", linear.created[0].Fingerprint, want)
 	}
 	if result.FailedOps != 0 {
 		t.Fatalf("FailedOps = %d, want 0", result.FailedOps)

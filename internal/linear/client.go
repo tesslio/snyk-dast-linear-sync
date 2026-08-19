@@ -250,10 +250,10 @@ func (c *Client) ExistingFingerprints(ctx context.Context, fingerprints []string
 
 	found := map[string]struct{}{}
 	var after *string
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query issuesByFingerprint($filter: IssueFilter!, $after: String) {
-  issues(first: 100, after: $after, filter: $filter) {
+  issues(first: 100, after: $after, filter: $filter, includeArchived: false) {
     nodes {
       id
       identifier
@@ -295,10 +295,17 @@ query issuesByFingerprint($filter: IssueFilter!, $after: String) {
 			}
 		}
 
-		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
+		next := resp.Issues.PageInfo.EndCursor
+		if !resp.Issues.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		after = resp.Issues.PageInfo.EndCursor
+		// A cursor that does not advance would loop forever. The run context may
+		// carry no deadline, so this is guarded explicitly rather than relying on
+		// cancellation to break out.
+		if after != nil && *next == *after {
+			return nil, fmt.Errorf("look up Linear issues by fingerprint: pagination cursor did not advance after page %d", page)
+		}
+		after = next
 	}
 
 	return found, nil

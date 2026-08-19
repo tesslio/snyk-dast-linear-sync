@@ -846,3 +846,97 @@ func TestPostCommentsKeepsPartialDataOnGraphQLError(t *testing.T) {
 		t.Fatalf("failed indices = %#v, want [1]", failed)
 	}
 }
+
+// TestExistingFingerprintsRejectsNonAdvancingCursor pins the pagination guard. A
+// server that keeps reporting hasNextPage with an unchanged cursor would loop
+// forever, and the run context may carry no deadline to break out of it.
+func TestExistingFingerprintsRejectsNonAdvancingCursor(t *testing.T) {
+	requests := 0
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				if requests > 10 {
+					t.Fatal("ExistingFingerprints kept paginating on an unchanged cursor")
+				}
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Always the same cursor, always claiming another page.
+				return jsonResponse(t, `{"data":{"issues":{
+					"nodes":[],
+					"pageInfo":{"hasNextPage":true,"endCursor":"stuck"}
+				}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	_, err := client.ExistingFingerprints(context.Background(), []string{"snyk-dast:t:1"})
+	if err == nil {
+		t.Fatal("ExistingFingerprints() error = nil, want an error when the cursor does not advance")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("error = %v, want it to name the non-advancing cursor", err)
+	}
+}
+
+// TestExistingFingerprintsReportsOnlyLiveMatches confirms the lookup returns the
+// requested fingerprints that exist and ignores anything else Linear returns.
+func TestExistingFingerprintsReportsOnlyLiveMatches(t *testing.T) {
+	var capturedQuery string
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				return jsonResponse(t, `{"data":{"issues":{
+					"nodes":[
+						{"id":"i1","identifier":"SEC-1","description":"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:t:1\n-->"},
+						{"id":"i9","identifier":"SEC-9","description":"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:t:999\n-->"}
+					],
+					"pageInfo":{"hasNextPage":false,"endCursor":null}
+				}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	found, err := client.ExistingFingerprints(context.Background(), []string{"snyk-dast:t:1", "snyk-dast:t:2"})
+	if err != nil {
+		t.Fatalf("ExistingFingerprints() error = %v", err)
+	}
+	if _, ok := found["snyk-dast:t:1"]; !ok {
+		t.Fatalf("found = %#v, want it to contain the live fingerprint", found)
+	}
+	if _, ok := found["snyk-dast:t:2"]; ok {
+		t.Fatal("found contains a fingerprint with no live issue")
+	}
+	if len(found) != 1 {
+		t.Fatalf("found = %#v, want exactly the one requested fingerprint that exists", found)
+	}
+	// Archived issues must not count as evidence a create landed, or the
+	// replacement ticket for a reopened archived finding would be suppressed.
+	if !strings.Contains(capturedQuery, "includeArchived: false") {
+		t.Fatalf("fingerprint lookup must be explicit about excluding archived issues, got:\n%s", capturedQuery)
+	}
+}

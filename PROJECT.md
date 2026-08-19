@@ -289,16 +289,17 @@ tickets:
   response body before returning any GraphQL error, so the successful aliases are
   still available even when an error is returned. Only the reported entries are
   retried; retrying the batch would duplicate the ones that already exist.
-- **Ambiguous failure.** The request failed at the transport level, so nothing is
-  known per entry — and crucially this does *not* prove Linear rejected the
-  mutation, which may have been committed before the response was lost. Creates
-  are therefore reconciled first: `ExistingFingerprints` asks Linear which of the
-  batch's fingerprints now have a live issue, and only the rest are re-created.
-  If that lookup also fails, nothing is retried and the entries are counted as
-  failed — the next run creates whatever is genuinely missing, because the finding
-  is still reported by Snyk DAST and will be absent from the next snapshot.
-  Missing a ticket for one cycle is recoverable; a duplicate is only undone later
-  by the duplicate-cancellation pass.
+- **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
+  entry. This covers a transport-level failure and equally a GraphQL failure that
+  returned no data, such as a rejected query. Crucially it does *not* prove Linear
+  rejected the mutation, which may have been committed before the response was
+  lost. Creates are therefore reconciled first: `ExistingFingerprints` asks Linear
+  which of the batch's fingerprints now have a live issue, and only the rest are
+  re-created. If that lookup also fails, nothing is retried and the entries are
+  counted as failed. The finding remains in the next Snyk DAST snapshot either
+  way; if its issue was never created it is absent from the next Linear snapshot
+  and gets created on the next run. Missing a ticket for one cycle is recoverable;
+  a duplicate is only undone later by the duplicate-cancellation pass.
 - **Ambiguous comment failure.** A comment carries no fingerprint to reconcile
   against, and a duplicated change comment is more disruptive than a missing one
   (the issue state itself is already correct), so these are counted in
