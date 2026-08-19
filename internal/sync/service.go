@@ -29,6 +29,9 @@ type LinearClient interface {
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
 	// PostComments returns the indices (into updates) whose comment failed.
 	PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error)
+	// ExistingFingerprints reports which of the given fingerprints already have a
+	// live issue in Linear, so an ambiguous write can be reconciled before retry.
+	ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error)
 }
 
 type CacheStore interface {
@@ -442,6 +445,50 @@ func (s *Service) commentOne(ctx context.Context, update model.IssueUpdate) erro
 	return nil
 }
 
+// retryUnlandedCreates reconciles an ambiguous batch-create failure. It asks
+// Linear which of the batch's fingerprints now have a live issue and re-creates
+// only the rest, so entries that were committed before the response was lost are
+// not duplicated.
+//
+// If the reconciliation query itself fails there is no safe way to tell what
+// landed, so nothing is retried: the entries are counted as failed and the next
+// run creates whatever is genuinely missing, since the finding is still reported
+// by Snyk DAST and will be absent from the next snapshot. Missing a ticket for
+// one cycle is recoverable; a duplicate ticket is not automatically undone until
+// the duplicate-cancellation pass sees both copies.
+func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.DesiredIssue, result *RunResult) {
+	fingerprints := make([]string, 0, len(batch))
+	for _, desired := range batch {
+		fingerprints = append(fingerprints, desired.Fingerprint)
+	}
+
+	landed, err := s.linear.ExistingFingerprints(ctx, fingerprints)
+	if err != nil {
+		atomic.AddInt64(&result.FailedOps, int64(len(batch)))
+		s.logger.Error("could not reconcile an ambiguous batch create against Linear; not retrying, the next run will create whatever is missing",
+			slog.Int("batch_size", len(batch)),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	for _, desired := range batch {
+		if _, ok := landed[desired.Fingerprint]; ok {
+			s.logger.Info("issue was created despite the batch error, not retrying",
+				slog.String("fingerprint", desired.Fingerprint),
+			)
+			continue
+		}
+		if err := s.createOne(ctx, desired); err != nil {
+			atomic.AddInt64(&result.FailedOps, 1)
+			s.logger.Error("failed to create issue",
+				slog.String("fingerprint", desired.Fingerprint),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
 // inRange guards indexing by a failed-index list. The Linear client derives the
 // indices from the slice it was handed, so they are always valid in practice,
 // but LinearClient is an interface and an out-of-range index would panic the
@@ -474,21 +521,16 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
 		switch {
 		case err != nil:
-			// No per-alias outcome is known (e.g. a transport failure), so every
-			// entry has to be retried individually.
-			s.logger.Warn("batch create failed, retrying issues individually",
+			// The outcome is ambiguous: a transport-level failure does not prove
+			// Linear rejected the mutation, because it may have been committed
+			// before the response was lost. Retrying blindly would duplicate every
+			// entry that actually landed, so ask Linear what exists first and
+			// retry only what is genuinely missing.
+			s.logger.Warn("batch create failed with an ambiguous outcome, reconciling against Linear before retry",
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
-			for _, desired := range job.desiredBatch {
-				if err := s.createOne(ctx, desired); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
+			s.retryUnlandedCreates(ctx, job.desiredBatch, result)
 		case len(failedIdx) > 0:
 			// Partial failure: only the reported entries still need creating.
 			// Retrying the whole batch would duplicate the ones that succeeded.
@@ -554,20 +596,16 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			failedIdx, err := s.linear.PostComments(ctx, job.updateBatch)
 			switch {
 			case err != nil:
-				s.logger.Warn("batch comment post failed, retrying individually",
+				// Ambiguous outcome, as above — but a comment carries no
+				// fingerprint to reconcile against, and a duplicated change
+				// comment is more disruptive than a missing one (the issue state
+				// itself is already correct). So these are counted and not
+				// retried.
+				atomic.AddInt64(&result.FailedComments, int64(len(job.updateBatch)))
+				s.logger.Warn("batch comment post failed with an ambiguous outcome, not retrying to avoid duplicate comments",
 					slog.Int("batch_size", len(job.updateBatch)),
 					slog.Any("error", err),
 				)
-				for _, update := range job.updateBatch {
-					if err := s.commentOne(ctx, update); err != nil {
-						atomic.AddInt64(&result.FailedComments, 1)
-						s.logger.Warn("failed to post change comment",
-							slog.String("issue", update.Existing.Identifier),
-							slog.String("fingerprint", update.Desired.Fingerprint),
-							slog.Any("error", err),
-						)
-					}
-				}
 			case len(failedIdx) > 0:
 				// Retry only the comments that failed, so the ones that already
 				// posted are not duplicated on the issue.

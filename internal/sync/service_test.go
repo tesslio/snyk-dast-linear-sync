@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,6 +39,15 @@ type fakeLinear struct {
 	// createAlwaysFailIdx makes every create call report a per-entry failure,
 	// including single-entry retries.
 	createAlwaysFailIdx bool
+
+	// createBatchErr makes the first (batch) create call fail with an error,
+	// simulating an ambiguous transport failure. landedFingerprints is what
+	// ExistingFingerprints then reports as already present in Linear, and
+	// existingErr makes that reconciliation query itself fail.
+	createBatchErr     error
+	landedFingerprints []string
+	existingErr        error
+	existingCalls      int
 }
 
 type fakeCache struct {
@@ -49,7 +59,31 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
+func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []string) (map[string]struct{}, error) {
+	f.existingCalls++
+	if f.existingErr != nil {
+		return nil, f.existingErr
+	}
+	wanted := map[string]struct{}{}
+	for _, fingerprint := range fingerprints {
+		wanted[fingerprint] = struct{}{}
+	}
+	found := map[string]struct{}{}
+	for _, fingerprint := range f.landedFingerprints {
+		if _, ok := wanted[fingerprint]; ok {
+			found[fingerprint] = struct{}{}
+		}
+	}
+	return found, nil
+}
+
 func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
+	if f.createBatchErr != nil && len(desired) > 1 {
+		// Only the multi-entry batch call fails; single-entry retries succeed.
+		err := f.createBatchErr
+		f.createBatchErr = nil
+		return nil, err
+	}
 	f.created = append(f.created, desired...)
 	if f.createAlwaysFailIdx {
 		// Every call, retries included, reports a per-entry failure with a nil
@@ -1906,4 +1940,88 @@ func TestRunCountsRetryFailuresReportedWithoutError(t *testing.T) {
 	if result.FailedOps != 1 {
 		t.Fatalf("FailedOps = %d, want 1: a create that failed without an error must still be counted", result.FailedOps)
 	}
+}
+
+// threeOpenFindings returns a snapshot with three open findings, for the
+// ambiguous-batch tests.
+func threeOpenFindings() fakeSnykDAST {
+	var findings []model.Finding
+	for i := 1; i <= 3; i++ {
+		findings = append(findings, model.Finding{
+			Fingerprint:       fmt.Sprintf("snyk-dast:target-a:finding-%d", i),
+			SnykDASTFindingID: fmt.Sprintf("su2d3k-%d", i),
+			TargetID:          "target-a",
+			IssueTitle:        "Reflected XSS",
+			Severity:          "high",
+			Status:            model.FindingOpen,
+			CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	return fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  findings,
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+}
+
+// TestRunReconcilesAmbiguousBatchCreateBeforeRetry covers the lost-response case:
+// a transport failure does not prove Linear rejected the mutation, so the entries
+// that actually landed must not be created a second time.
+func TestRunReconcilesAmbiguousBatchCreateBeforeRetry(t *testing.T) {
+	linear := &fakeLinear{
+		createBatchErr: errors.New("connection reset by peer"),
+		// Two of the three creates were committed before the response was lost.
+		landedFingerprints: []string{
+			"snyk-dast:target-a:finding-1",
+			"snyk-dast:target-a:finding-3",
+		},
+	}
+
+	result, err := New(baseTestConfig(), discardLogger(), threeOpenFindings(), linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if linear.existingCalls != 1 {
+		t.Fatalf("ExistingFingerprints calls = %d, want 1", linear.existingCalls)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d (%#v), want 1: only the entry that did not land may be recreated",
+			len(linear.created), desiredFingerprints(linear.created))
+	}
+	if linear.created[0].Fingerprint != "snyk-dast:target-a:finding-2" {
+		t.Fatalf("recreated %q, want the un-landed finding-2", linear.created[0].Fingerprint)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0", result.FailedOps)
+	}
+}
+
+// TestRunSkipsRetryWhenReconciliationFails covers the other branch: with no way
+// to tell what landed, nothing is retried. A missing ticket is recoverable on the
+// next run; a duplicate is not.
+func TestRunSkipsRetryWhenReconciliationFails(t *testing.T) {
+	linear := &fakeLinear{
+		createBatchErr: errors.New("connection reset by peer"),
+		existingErr:    errors.New("lookup failed too"),
+	}
+
+	result, err := New(baseTestConfig(), discardLogger(), threeOpenFindings(), linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0: an unreconcilable ambiguous failure must not be retried", len(linear.created))
+	}
+	if result.FailedOps != 3 {
+		t.Fatalf("FailedOps = %d, want 3 (the whole unreconciled batch)", result.FailedOps)
+	}
+}
+
+func desiredFingerprints(desired []model.DesiredIssue) []string {
+	out := make([]string, 0, len(desired))
+	for _, d := range desired {
+		out = append(out, d.Fingerprint)
+	}
+	return out
 }

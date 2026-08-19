@@ -209,6 +209,101 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 	}
 }
 
+// ExistingFingerprints returns the subset of fingerprints that currently have a
+// LIVE (non-archived) managed issue in Linear. It exists to reconcile ambiguous
+// write outcomes: when a batch create fails at the transport level, the mutation
+// may still have been committed before the response was lost, so retrying blindly
+// duplicates tickets. Asking Linear what actually exists resolves that.
+//
+// Archived issues are deliberately excluded. A live issue is evidence the create
+// landed; an archived one is not, and counting it would suppress the deliberate
+// replacement ticket created when an archived issue's finding becomes active
+// again.
+func (c *Client) ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error) {
+	wanted := make(map[string]struct{}, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		if trimmed := strings.TrimSpace(fingerprint); trimmed != "" {
+			wanted[trimmed] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	if err := c.resolveTeam(ctx); err != nil {
+		return nil, err
+	}
+
+	clauses := make([]linearapi.IssueFilter, 0, len(wanted))
+	for fingerprint := range wanted {
+		clauses = append(clauses, linearapi.IssueFilter{
+			Description: &linearapi.NullableStringComparator{
+				Contains: new(fingerprint),
+			},
+		})
+	}
+	filter := linearapi.IssueFilter{
+		Team: &linearapi.TeamFilter{
+			Id: &linearapi.IDComparator{Eq: c.teamID()},
+		},
+		Or: clauses,
+	}
+
+	found := map[string]struct{}{}
+	var after *string
+	for {
+		op := gqlclient.NewOperation(`
+query issuesByFingerprint($filter: IssueFilter!, $after: String) {
+  issues(first: 100, after: $after, filter: $filter) {
+    nodes {
+      id
+      identifier
+      description
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}`)
+		op.Var("filter", filter)
+		op.Var("after", after)
+
+		var resp struct {
+			Issues struct {
+				Nodes []struct {
+					ID          string  `json:"id"`
+					Identifier  string  `json:"identifier"`
+					Description *string `json:"description"`
+				} `json:"nodes"`
+				PageInfo struct {
+					HasNextPage bool    `json:"hasNextPage"`
+					EndCursor   *string `json:"endCursor"`
+				} `json:"pageInfo"`
+			} `json:"issues"`
+		}
+		if err := c.execute(ctx, op, &resp); err != nil {
+			return nil, fmt.Errorf("look up Linear issues by fingerprint: %w", err)
+		}
+
+		for _, issue := range resp.Issues.Nodes {
+			fingerprint := extractFingerprint(deref(issue.Description))
+			if fingerprint == "" {
+				continue
+			}
+			if _, ok := wanted[fingerprint]; ok {
+				found[fingerprint] = struct{}{}
+			}
+		}
+
+		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
+			break
+		}
+		after = resp.Issues.PageInfo.EndCursor
+	}
+
+	return found, nil
+}
+
 func (c *Client) StateID(state model.IssueState) (string, error) {
 	var name string
 	switch state {

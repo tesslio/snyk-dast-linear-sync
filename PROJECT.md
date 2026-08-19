@@ -278,6 +278,37 @@ It uses:
 The cache is critical for steady-state performance. A healthy steady-state run
 should do little or no work when nothing has changed.
 
+### Batch Failure Handling
+
+Linear mutations are batched, one GraphQL alias per entry, so a batch can fail
+three different ways and each needs different handling to avoid duplicating
+tickets:
+
+- **Per-alias failure.** The response carries `success: false`, or omits the
+  alias, while the other aliases succeeded. Note that `gqlclient` decodes the
+  response body before returning any GraphQL error, so the successful aliases are
+  still available even when an error is returned. Only the reported entries are
+  retried; retrying the batch would duplicate the ones that already exist.
+- **Ambiguous failure.** The request failed at the transport level, so nothing is
+  known per entry — and crucially this does *not* prove Linear rejected the
+  mutation, which may have been committed before the response was lost. Creates
+  are therefore reconciled first: `ExistingFingerprints` asks Linear which of the
+  batch's fingerprints now have a live issue, and only the rest are re-created.
+  If that lookup also fails, nothing is retried and the entries are counted as
+  failed — the next run creates whatever is genuinely missing, because the finding
+  is still reported by Snyk DAST and will be absent from the next snapshot.
+  Missing a ticket for one cycle is recoverable; a duplicate is only undone later
+  by the duplicate-cancellation pass.
+- **Ambiguous comment failure.** A comment carries no fingerprint to reconcile
+  against, and a duplicated change comment is more disruptive than a missing one
+  (the issue state itself is already correct), so these are counted in
+  `FailedComments` and not retried.
+
+A residual race remains by construction: Linear's `issueCreate` exposes no
+idempotency key, so a write that lands between the reconciliation query and the
+retry still duplicates. The duplicate-cancellation pass converges that case on a
+later run.
+
 ## SQLite Cache
 
 The SQLite cache stores:
