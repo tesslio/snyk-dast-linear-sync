@@ -1207,3 +1207,103 @@ func TestFetchLabelsByIssueIDFiltersByIssueID(t *testing.T) {
 		t.Fatalf("labels = %#v, want issue-2 absent rather than an empty entry", labels)
 	}
 }
+
+// TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated covers the pagination edge
+// of the live label read. A protected label past the page boundary would be
+// absent from the read, and the update would then delete it — the exact failure
+// the read exists to prevent. So a truncated page must fail the issue closed, not
+// be treated as a complete label set.
+func TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated(t *testing.T) {
+	var sawUpdateMutation bool
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+			Labels: config.LabelConfig{Protected: protectedTestLabels},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if strings.Contains(string(body), "issueUpdate") {
+					sawUpdateMutation = true
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				// The issue's labels do not fit one page, so the protected label
+				// may be on a page this read never saw.
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[
+					{"id":"issue-1","labels":{
+						"nodes":[{"id":"label-ordinary","name":"customer-visible"}],
+						"pageInfo":{"hasNextPage":true}
+					}}
+				]}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	updates := []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SEC-1"},
+		Desired:  model.DesiredIssue{State: model.StateTodo},
+	}}
+
+	err := client.UpdateIssues(context.Background(), updates)
+	if err == nil {
+		t.Fatal("UpdateIssues() error = nil, want a refusal when the live label page is truncated")
+	}
+	if !strings.Contains(err.Error(), "SEC-1") {
+		t.Fatalf("UpdateIssues() error = %v, want it to name the issue", err)
+	}
+	if sawUpdateMutation {
+		t.Fatal("UpdateIssues() sent an update mutation from a truncated label page; a protected label past the page boundary would be deleted")
+	}
+}
+
+// TestFetchLabelsByIssueIDRequestsLabelPageInfo pins the query shape: without
+// pageInfo on the nested labels connection there is no way to tell a complete
+// label set from a truncated one.
+func TestFetchLabelsByIssueIDRequestsLabelPageInfo(t *testing.T) {
+	var capturedQuery string
+
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.fetchLabelsByIssueID(context.Background(), []string{"issue-1"}); err != nil {
+		t.Fatalf("fetchLabelsByIssueID() error = %v", err)
+	}
+	if !strings.Contains(capturedQuery, "hasNextPage") {
+		t.Fatalf("live label query must request the labels pageInfo, got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, fmt.Sprintf("labels(first: %d)", maxLiveLabelPage)) {
+		t.Fatalf("live label query must request %d labels per issue, got:\n%s", maxLiveLabelPage, capturedQuery)
+	}
+}

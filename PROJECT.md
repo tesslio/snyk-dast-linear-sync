@@ -174,7 +174,13 @@ served from the snapshot:
 - an issue missing from that read is indistinguishable from one carrying no
   protected label, so the batch is failed rather than guessed at. The caller
   already retries issues individually, so only the unreadable issue is reported
-  failed.
+  failed, and it lands in `FailedOps`, which fails the run.
+- the labels connection is checked for truncation (`pageInfo.hasNextPage`) and a
+  truncated page fails the issue closed too: a protected label past the page
+  boundary would be absent from the read and then deleted by the update, which is
+  the exact failure the read exists to prevent. Refusing beats paginating — a
+  nested connection cannot be paged within the one query, and an issue with more
+  than 250 labels is pathological rather than a case worth serving.
 - protected labels are never asserted from the managed set, bounding the blast
   radius of a misconfiguration.
 - creates need no handling: there is no pre-existing label set to replace.

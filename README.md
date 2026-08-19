@@ -260,10 +260,11 @@ opening snapshot. So when any label is protected:
   write, and carries protected labels over from that live read rather than from
   the snapshot. A protected label added since the snapshot is preserved; one
   removed since the snapshot is not resurrected.
-- if that live read returns nothing for an issue, its update is refused rather
-  than proceeding — writing a label set that might drop a protected label is
-  worse than skipping one issue for one run. The caller retries issues
-  individually, so the rest of the batch still lands.
+- if that live read returns nothing for an issue, or returns a truncated page of
+  its labels, the update is refused rather than proceeding — writing a label set
+  that might drop a protected label is worse than skipping one issue for one run.
+  The caller retries issues individually, so the rest of the batch still lands,
+  and the refusal is counted in `failed_ops`, which fails the run.
 - protected labels are never asserted from the managed set either, so a
   misconfiguration cannot stamp another actor's control label onto a ticket that
   does not carry one.

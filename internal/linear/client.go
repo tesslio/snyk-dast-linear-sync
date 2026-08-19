@@ -22,6 +22,13 @@ import (
 const (
 	titlePrefix    = "Snyk DAST:"
 	metadataHeader = "<!-- snyk-dast-linear-sync"
+
+	// maxLiveLabelPage is how many labels the live label read requests per issue.
+	// It is Linear's per-connection maximum, chosen so the page cannot truncate
+	// in practice; if it does anyway, fetchLabelsByIssueID fails that issue
+	// closed rather than returning a label set a protected label may be missing
+	// from.
+	maxLiveLabelPage = 250
 )
 
 type Client struct {
@@ -1250,31 +1257,44 @@ func (c *Client) protectedLabelNames() map[string]struct{} {
 // snapshot.
 //
 // includeArchived is set because an archived ticket can still be the target of
-// an update. One page suffices in both directions: the update batch size (10)
-// bounds the issue count, and no real issue carries anywhere near 250 labels.
-// The 250 is deliberately generous rather than tuned — truncating the label page
-// would silently drop a protected label, which is the exact failure this guards
-// against. The complexity cost is ~2,500 points per update batch, well inside
-// Linear's 10,000-per-query limit.
+// an update. The issue side needs no pagination: the update batch size (10)
+// bounds it, and `first` is set from the batch.
+//
+// The label side is a connection and therefore can truncate, so its pageInfo is
+// checked. A truncated label page is not usable as the authority for protected
+// labels — a protected label past the page boundary would be absent from the
+// live read, and the update would then delete it, which is the exact failure
+// this read exists to prevent. Such an issue is therefore omitted from the
+// result, which UpdateIssues treats as unreadable and refuses. Refusing beats
+// paginating here: a nested connection cannot be paged in this one query, and an
+// issue with more than maxLiveLabelPage labels is pathological rather than a
+// case worth serving. The refusal is loud (a warning plus a failed op, which
+// fails the run) instead of silently dropping a label.
+//
+// The complexity cost is roughly maxLiveLabelPage x batch size per update batch,
+// well inside Linear's 10,000-per-query limit.
 func (c *Client) fetchLabelsByIssueID(ctx context.Context, issueIDs []string) (map[string][]model.IssueLabel, error) {
 	if len(issueIDs) == 0 {
 		return nil, nil
 	}
 
-	op := gqlclient.NewOperation(`
+	op := gqlclient.NewOperation(fmt.Sprintf(`
 query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
   issues(filter: $filter, first: $first, includeArchived: true) {
     nodes {
       id
-      labels(first: 250) {
+      labels(first: %d) {
         nodes {
           id
           name
         }
+        pageInfo {
+          hasNextPage
+        }
       }
     }
   }
-}`)
+}`, maxLiveLabelPage))
 	op.Var("filter", linearapi.IssueFilter{
 		Id: &linearapi.IDComparator{In: issueIDs},
 	})
@@ -1289,6 +1309,9 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 						ID   string `json:"id"`
 						Name string `json:"name"`
 					} `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool `json:"hasNextPage"`
+					} `json:"pageInfo"`
 				} `json:"labels"`
 			} `json:"nodes"`
 		} `json:"issues"`
@@ -1299,6 +1322,13 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 
 	out := make(map[string][]model.IssueLabel, len(resp.Issues.Nodes))
 	for _, node := range resp.Issues.Nodes {
+		if node.Labels.PageInfo.HasNextPage {
+			c.log.Warn("Linear issue carries more labels than one page of the live label read; refusing to update it rather than risk deleting a protected label",
+				slog.String("issue_id", node.ID),
+				slog.Int("page_size", maxLiveLabelPage),
+			)
+			continue
+		}
 		labels := make([]model.IssueLabel, 0, len(node.Labels.Nodes))
 		for _, label := range node.Labels.Nodes {
 			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name})
