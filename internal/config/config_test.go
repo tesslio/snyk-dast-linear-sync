@@ -188,3 +188,65 @@ func TestValidateRejectsOverflowingArchiveLookback(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadParsesProtectedLabels pins the parsing of LINEAR_PROTECTED_LABELS:
+// comma-separated, whitespace-trimmed, empty entries dropped. The names are
+// preserved verbatim (not lower-cased) because they are matched
+// case-insensitively at use, but written back to Linear as-is.
+func TestLoadParsesProtectedLabels(t *testing.T) {
+	t.Setenv("SNYK_DAST_API_KEY", "api-key")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_PROTECTED_LABELS", " df:dispatch , ,df:dispatch-complete ")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got := cfg.Linear.Labels.Protected
+	want := []string{"df:dispatch", "df:dispatch-complete"}
+	if len(got) != len(want) {
+		t.Fatalf("Protected = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Protected = %#v, want %#v", got, want)
+		}
+	}
+}
+
+// TestLoadDefaultsToNoProtectedLabels keeps the live-label read off the hot path
+// unless it is explicitly asked for.
+func TestLoadDefaultsToNoProtectedLabels(t *testing.T) {
+	t.Setenv("SNYK_DAST_API_KEY", "api-key")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_PROTECTED_LABELS", "")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Linear.Labels.Protected) != 0 {
+		t.Fatalf("Protected = %#v, want empty by default", cfg.Linear.Labels.Protected)
+	}
+}
+
+// TestLoadProtectedLabelsCanBeDisabled keeps the escape hatch working for a
+// deployment that inherits a protected list from an env file and wants it off
+// for one run.
+func TestLoadProtectedLabelsCanBeDisabled(t *testing.T) {
+	t.Setenv("SNYK_DAST_API_KEY", "api-key")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_PROTECTED_LABELS", "off")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Linear.Labels.Protected) != 0 {
+		t.Fatalf("Protected = %#v, want empty when disabled with \"off\"", cfg.Linear.Labels.Protected)
+	}
+}

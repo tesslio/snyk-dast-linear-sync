@@ -241,6 +241,38 @@ If the configured label does not exist in Linear, the run fails with a clear mes
 - default: `off`
 - set to `off` to disable the fallback
 
+`LINEAR_PROTECTED_LABELS` lists labels this sync must never add to, or remove
+from, an existing ticket. Use it for labels another actor owns as control state —
+a triage bot, a dispatch harness, a human workflow — where deleting one silently
+undoes that actor's decision.
+
+- format: comma-separated label names
+- example: `df:dispatch,df:dispatch-complete`
+- default: empty (no labels protected)
+- set to `off` to disable protection entirely, overriding any value in an env file
+
+Protection is needed because Linear's `issueUpdate` replaces a ticket's whole
+label set rather than applying a delta: every update echoes back the label set
+this sync last saw, which deletes anything another actor added since the run's
+opening snapshot. So when any label is protected:
+
+- each update batch re-reads the current labels of the issues it is about to
+  write, and carries protected labels over from that live read rather than from
+  the snapshot. A protected label added since the snapshot is preserved; one
+  removed since the snapshot is not resurrected.
+- if that live read returns nothing for an issue, its update is refused rather
+  than proceeding — writing a label set that might drop a protected label is
+  worse than skipping one issue for one run. The caller retries issues
+  individually, so the rest of the batch still lands.
+- protected labels are never asserted from the managed set either, so a
+  misconfiguration cannot stamp another actor's control label onto a ticket that
+  does not carry one.
+- new issues need no special handling: a create has no pre-existing label set to
+  replace.
+
+The live read costs one extra query per update batch, so it is skipped entirely
+when no labels are protected.
+
 `LINEAR_UNSUBSCRIBE_ACTOR` controls whether the Linear API actor should be kept off the subscriber list for managed issue creates and updates:
 
 - default: `true`
@@ -409,6 +441,7 @@ Optional:
 - `LINEAR_CHECK_TYPE_LABEL_DEFAULT`
 - `LINEAR_TARGET_TYPE_LABELS`
 - `LINEAR_TARGET_TYPE_LABEL_DEFAULT`
+- `LINEAR_PROTECTED_LABELS`
 - `LINEAR_UNSUBSCRIBE_ACTOR`
 - `LINEAR_COMMENTS`
 - `LINEAR_ARCHIVE_LOOKBACK_DAYS`
@@ -436,6 +469,26 @@ go run ./cmd/investigate-duedate --env-file .env --issue SEC-12127
 ```
 
 Add `--json` for machine-readable output.
+
+## Exit Status
+
+The sync exits non-zero when a state-changing Linear operation was left
+permanently unapplied, so a scheduler or CI job notices the drift instead of
+seeing a successful run that quietly dropped work.
+
+"Permanently" is the key word. Batch mutations are retried per entry, and only
+the outcome after that retry counts:
+
+- a batch that fails and whose retry lands is a **successful** run — the
+  operation applied, it just took two calls
+- a create, update, resolve or duplicate-cancellation whose retry also failed, or
+  which was deliberately left for the next run because reconciliation was
+  impossible, is counted in `failed_ops` and **fails** the run
+- `failed_comments` never fails the run: a missing change comment leaves the
+  synced issue state correct, and comments are opt-in via `LINEAR_COMMENTS`
+
+Both counts appear in the `sync complete` summary log either way, and that
+summary is emitted before the exit status is decided.
 
 ## Logs
 

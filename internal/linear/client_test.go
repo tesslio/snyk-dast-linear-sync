@@ -42,7 +42,7 @@ func TestDesiredLabelIDsReplacesPreviousManagedLabel(t *testing.T) {
 		ManagedLabels: []string{"snyk-dast-automation", "snyk-dast-api"},
 	}
 
-	labelIDs, err := client.desiredLabelIDs(existing, desired)
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
@@ -74,7 +74,7 @@ func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 		},
 	}
 
-	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{})
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
@@ -938,5 +938,272 @@ func TestExistingFingerprintsReportsOnlyLiveMatches(t *testing.T) {
 	// replacement ticket for a reopened archived finding would be suppressed.
 	if !strings.Contains(capturedQuery, "includeArchived: false") {
 		t.Fatalf("fingerprint lookup must be explicit about excluding archived issues, got:\n%s", capturedQuery)
+	}
+}
+
+// protectedTestLabels is a representative protected set: control labels owned by
+// another actor (a triage/dispatch bot) that this sync must never add or remove.
+var protectedTestLabels = []string{"df:dispatch", "df:dispatch-complete"}
+
+func protectedLabelClient() *Client {
+	return &Client{
+		cfg: config.LinearConfig{
+			Labels: config.LabelConfig{
+				Managed:   "snyk-dast-automation",
+				Protected: protectedTestLabels,
+			},
+		},
+		managedLabelIDs: map[string]string{
+			"snyk-dast-automation": "label-managed",
+			"df:dispatch":          "label-dispatch",
+		},
+	}
+}
+
+// TestDesiredLabelIDsPreservesProtectedLabelAddedMidRun covers the race the
+// protected set exists for: another actor labels a ticket after this run's
+// opening snapshot, then an update echoes the whole label set back and deletes
+// the label. The live read is the authority for protected labels, so it must
+// win over the snapshot.
+func TestDesiredLabelIDsPreservesProtectedLabelAddedMidRun(t *testing.T) {
+	client := protectedLabelClient()
+
+	existing := model.ExistingIssue{
+		ManagedLabels: []string{"snyk-dast-automation"},
+		Labels: []model.IssueLabel{
+			{ID: "label-unrelated", Name: "customer-visible"},
+			{ID: "label-managed", Name: "snyk-dast-automation"},
+		},
+	}
+	// The live read sees a protected label the snapshot never had.
+	live := []model.IssueLabel{
+		{ID: "label-unrelated", Name: "customer-visible"},
+		{ID: "label-managed", Name: "snyk-dast-automation"},
+		{ID: "label-dispatch", Name: "df:dispatch"},
+	}
+	desired := model.DesiredIssue{ManagedLabels: []string{"snyk-dast-automation"}}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, live)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if !containsString(labelIDs, "label-dispatch") {
+		t.Fatalf("labelIDs = %#v, want the protected df:dispatch label preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-unrelated") {
+		t.Fatalf("labelIDs = %#v, want unrelated labels still preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-managed") {
+		t.Fatalf("labelIDs = %#v, want the managed label still asserted", labelIDs)
+	}
+}
+
+// TestDesiredLabelIDsDropsProtectedLabelRemovedMidRun is the other direction:
+// protection must not resurrect a label the owning actor has just removed, so an
+// update must never re-add one the snapshot still carries.
+func TestDesiredLabelIDsDropsProtectedLabelRemovedMidRun(t *testing.T) {
+	client := protectedLabelClient()
+
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-unrelated", Name: "customer-visible"},
+			{ID: "label-dispatch", Name: "df:dispatch"},
+		},
+	}
+	// The owning actor removed df:dispatch and added the terminal gate.
+	live := []model.IssueLabel{
+		{ID: "label-unrelated", Name: "customer-visible"},
+		{ID: "label-complete", Name: "df:dispatch-complete"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, live)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-dispatch") {
+		t.Fatalf("labelIDs = %#v, want the removed protected label left off", labelIDs)
+	}
+	if !containsString(labelIDs, "label-complete") {
+		t.Fatalf("labelIDs = %#v, want the live protected label preserved", labelIDs)
+	}
+}
+
+// TestDesiredLabelIDsNeverAssertsProtectedLabelFromManagedSet bounds the blast
+// radius of a misconfiguration: even if a protected label somehow lands in the
+// managed set, an update must not stamp another actor's control label onto a
+// ticket that does not carry it.
+func TestDesiredLabelIDsNeverAssertsProtectedLabelFromManagedSet(t *testing.T) {
+	client := protectedLabelClient()
+
+	desired := model.DesiredIssue{ManagedLabels: []string{"snyk-dast-automation", "df:dispatch"}}
+
+	labelIDs, err := client.desiredLabelIDs(model.ExistingIssue{}, desired, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-dispatch") {
+		t.Fatalf("labelIDs = %#v, want no protected label asserted from the managed set", labelIDs)
+	}
+	if !containsString(labelIDs, "label-managed") {
+		t.Fatalf("labelIDs = %#v, want the non-protected managed label present", labelIDs)
+	}
+}
+
+// TestUpdateIssuesRefusesUpdateWhenLiveLabelsUnreadable pins the fail-closed
+// choice. An issue absent from the live read is indistinguishable from one with
+// no protected label, so the update must not proceed — guessing wrong deletes
+// another actor's control label. The caller retries issues individually, so only
+// the unreadable one is reported failed.
+func TestUpdateIssuesRefusesUpdateWhenLiveLabelsUnreadable(t *testing.T) {
+	var sawUpdateMutation bool
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+			Labels: config.LabelConfig{Protected: protectedTestLabels},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if strings.Contains(string(body), "issueUpdate") {
+					sawUpdateMutation = true
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				// The live label read returns nothing for the requested issue.
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	updates := []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SEC-1"},
+		Desired:  model.DesiredIssue{State: model.StateTodo},
+	}}
+
+	err := client.UpdateIssues(context.Background(), updates)
+	if err == nil {
+		t.Fatal("UpdateIssues() error = nil, want a refusal when live labels cannot be read")
+	}
+	if !strings.Contains(err.Error(), "SEC-1") {
+		t.Fatalf("UpdateIssues() error = %v, want it to name the unreadable issue", err)
+	}
+	if sawUpdateMutation {
+		t.Fatal("UpdateIssues() sent an update mutation despite being unable to preserve protected labels")
+	}
+}
+
+// TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels keeps the extra query
+// off the hot path for anyone running without protected labels configured.
+func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
+	var sawLabelRead bool
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if strings.Contains(string(body), "issueLabelsByID") {
+					sawLabelRead = true
+				}
+				return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	updates := []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SEC-1"},
+		Desired:  model.DesiredIssue{State: model.StateTodo},
+	}}
+
+	if err := client.UpdateIssues(context.Background(), updates); err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+	if sawLabelRead {
+		t.Fatal("UpdateIssues() read live labels with no protected labels configured")
+	}
+}
+
+// TestFetchLabelsByIssueIDFiltersByIssueID pins the live read's shape: it must
+// filter by the exact issue IDs of the batch and include archived issues, since
+// an archived ticket can still be the target of an update.
+func TestFetchLabelsByIssueIDFiltersByIssueID(t *testing.T) {
+	var capturedQuery string
+	var capturedFilter map[string]any
+
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				if filter, ok := payload.Variables["filter"].(map[string]any); ok {
+					capturedFilter = filter
+				}
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[
+					{"id":"issue-1","labels":{"nodes":[{"id":"label-dispatch","name":"df:dispatch"}]}}
+				]}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	labels, err := client.fetchLabelsByIssueID(context.Background(), []string{"issue-1", "issue-2"})
+	if err != nil {
+		t.Fatalf("fetchLabelsByIssueID() error = %v", err)
+	}
+
+	if !strings.Contains(capturedQuery, "includeArchived: true") {
+		t.Fatalf("live label query must pass includeArchived: true, got:\n%s", capturedQuery)
+	}
+	id, ok := capturedFilter["id"].(map[string]any)
+	if !ok {
+		t.Fatalf("filter must carry an id comparator, got: %#v", capturedFilter)
+	}
+	in, ok := id["in"].([]any)
+	if !ok || len(in) != 2 {
+		t.Fatalf("filter id.in = %#v, want both batch issue IDs", id["in"])
+	}
+
+	if len(labels["issue-1"]) != 1 || labels["issue-1"][0].Name != "df:dispatch" {
+		t.Fatalf("labels[issue-1] = %#v, want the df:dispatch label", labels["issue-1"])
+	}
+	// issue-2 is absent from the response, and must stay absent from the map so
+	// UpdateIssues can tell "unreadable" from "no protected labels".
+	if _, ok := labels["issue-2"]; ok {
+		t.Fatalf("labels = %#v, want issue-2 absent rather than an empty entry", labels)
 	}
 }
