@@ -40,10 +40,13 @@ const (
 	// expresses in months, via Team.autoArchivePeriod). A ticket archived longer
 	// ago than this window drops out of the snapshot, so Snyk DAST findings that
 	// stay terminal forever can still have a duplicate minted once the window
-	// passes. Widening the window defers that, it does not prevent it; the
-	// structural fix is to not create tickets for findings that are already
-	// terminal and have no ticket at all. 35 days keeps the snapshot bounded
-	// while covering the recently-archived tickets that churn most.
+	// passes, and those copies accumulate rather than converging. That is an
+	// accepted trade-off: the project wants every finding to end up with a
+	// ticket, so creates are not suppressed for already-terminal findings.
+	// Raising this far enough to cover the whole archived backlog prevents the
+	// duplication outright, traded against snapshot size and Linear's
+	// query-complexity limits. 35 days keeps the snapshot bounded while covering
+	// the recently-archived tickets that churn most.
 	defaultArchiveLookbackDays = 35
 )
 

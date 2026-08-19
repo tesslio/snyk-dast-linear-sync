@@ -303,9 +303,9 @@ been archived becomes active again, a replacement ticket is created.
 
 Creating a replacement is a deliberate choice rather than an API limitation.
 Linear exposes an `issueUnarchive` mutation with no documented precondition, so
-restoring the original ticket and updating it is possible; that would preserve
-the ticket's history and comments at the cost of reusing one ticket across
-recurrences. Switch to unarchive-then-update if that trade is preferable.
+restoring the original ticket and updating it would be possible. That path was
+considered and not taken: each recurrence gets a clean ticket with its own SLA
+clock, rather than one ticket reused indefinitely across recurrences.
 
 #### Known limitation
 
@@ -316,11 +316,21 @@ snapshot. Because Snyk DAST retains `fixed`, `accepted`, and `invalid` findings
 indefinitely, such a finding then looks ticketless again and a duplicate closed
 ticket can be created — once per archive cycle rather than every run.
 
-Widening the window defers this rather than preventing it. The structural fix is
-to not create tickets for findings that are already terminal and have no ticket
-at all, since a closed ticket for a finding the team never triaged carries
-little value; that changes which tickets get created, so it is deliberately not
-bundled in here.
+This is an accepted trade-off. The alternative — not creating tickets for
+findings that are already terminal and have no ticket — was considered and
+rejected: every Snyk DAST finding should end up with a Linear ticket, including
+findings that were already closed before the sync first ran, so the ticket
+history is complete.
+
+Note that the duplicates do not converge on their own. Once the original ticket
+is past the window it is absent from the snapshot, so the duplicate-cancellation
+pass cannot see it and the copies simply accumulate — roughly one extra closed
+ticket per archive cycle per permanently-terminal finding.
+
+Raising `LINEAR_ARCHIVE_LOOKBACK_DAYS` reduces how often this happens, and a
+window long enough to cover all archived managed tickets prevents it outright,
+at the cost of a larger snapshot on every run. Weigh that against Linear's
+query-complexity and rate limits if you have a large closed backlog.
 
 ### Due Dates
 
