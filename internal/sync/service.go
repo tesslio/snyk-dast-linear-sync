@@ -60,7 +60,16 @@ type RunResult struct {
 	PlannedUpdates      int64
 	PlannedResolves     int64
 	CancelledDuplicates int64
-	FailedOps           int64
+	// FailedOps counts state-changing operations that did not apply: creates,
+	// updates, resolves and duplicate cancellations.
+	FailedOps int64
+	// FailedComments counts change comments that could not be posted. These are
+	// tracked separately from FailedOps because a missing comment leaves the
+	// synced issue state correct — the comment is explanatory, and the feature is
+	// opt-in via LINEAR_COMMENTS — so it should not read as a failed sync
+	// operation. It is counted rather than only logged so a run cannot report
+	// success while silently dropping comments.
+	FailedComments int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, snykdast SnykDASTClient, linear LinearClient, cacheStore CacheStore) *Service {
@@ -551,6 +560,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				)
 				for _, update := range job.updateBatch {
 					if err := s.commentOne(ctx, update); err != nil {
+						atomic.AddInt64(&result.FailedComments, 1)
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),
@@ -567,6 +577,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				)
 				for _, idx := range failedIdx {
 					if !inRange(idx, len(job.updateBatch)) {
+						atomic.AddInt64(&result.FailedComments, 1)
 						s.logger.Warn("Linear client reported an out-of-range failed comment index",
 							slog.Int("index", idx),
 							slog.Int("batch_size", len(job.updateBatch)),
@@ -575,6 +586,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					}
 					update := job.updateBatch[idx]
 					if err := s.commentOne(ctx, update); err != nil {
+						atomic.AddInt64(&result.FailedComments, 1)
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),

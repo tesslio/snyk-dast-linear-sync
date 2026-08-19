@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -794,5 +795,54 @@ func TestCreateIssuesReturnsErrorWhenNoAliasesDecoded(t *testing.T) {
 	desired := []model.DesiredIssue{{Fingerprint: "f0", Title: "a", State: model.StateTodo}}
 	if _, err := client.CreateIssues(context.Background(), desired); err == nil {
 		t.Fatal("CreateIssues() error = nil, want an error when no alias outcome is known")
+	}
+}
+
+// TestPostCommentsKeepsPartialDataOnGraphQLError mirrors the CreateIssues
+// partial-data test for comments: aliases that posted must not be retried, or
+// the issue ends up with the same change comment twice.
+func TestPostCommentsKeepsPartialDataOnGraphQLError(t *testing.T) {
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Comments 0 and 2 posted; comment 1 errored.
+				return jsonResponse(t, `{
+					"data":{
+						"commentCreate0":{"success":true,"comment":{"id":"c0"}},
+						"commentCreate2":{"success":true,"comment":{"id":"c2"}}
+					},
+					"errors":[{"message":"Entity not found: Issue"}]
+				}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	// Each update needs a diff, or buildChangeComment returns "" and the update
+	// is never given a comment alias.
+	updates := make([]model.IssueUpdate, 0, 3)
+	for i := range 3 {
+		updates = append(updates, model.IssueUpdate{
+			Existing: model.ExistingIssue{ID: fmt.Sprintf("i%d", i), Identifier: fmt.Sprintf("SEC-%d", i), StateName: "Todo"},
+			Desired:  model.DesiredIssue{Fingerprint: fmt.Sprintf("f%d", i), State: model.StateDone},
+			Diff:     &model.IssueDiff{StateChanged: true, StateFrom: "Todo", StateTo: "Done"},
+		})
+	}
+
+	failed, err := client.PostComments(context.Background(), updates)
+	if err != nil {
+		t.Fatalf("PostComments() error = %v, want nil: partial data must not be discarded, "+
+			"otherwise the two posted comments are duplicated on retry", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
 	}
 }
