@@ -288,8 +288,22 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 			Identifier string `json:"identifier"`
 		} `json:"issue"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return nil, fmt.Errorf("create Linear issues: %w", err)
+	// gqlclient decodes the response body into `resp` BEFORE returning any
+	// GraphQL error, so a mutation that failed for individual aliases still
+	// leaves the successful ones decoded here. Those issues exist in Linear
+	// already: discarding them and reporting a batch error would send the caller
+	// into a retry that recreates every one of them. So derive per-alias
+	// outcomes whenever anything came back, and only surface the error when
+	// nothing did (transport failure, HTTP error, undecodable body).
+	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+		if len(resp) == 0 {
+			return nil, fmt.Errorf("create Linear issues: %w", execErr)
+		}
+		c.log.Warn("Linear issue create batch reported errors for some entries; the rest were created",
+			slog.Int("aliases_returned", len(resp)),
+			slog.Int("batch_size", len(desired)),
+			slog.Any("error", execErr),
+		)
 	}
 
 	var failed []int
@@ -422,8 +436,18 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 			ID string `json:"id"`
 		} `json:"comment"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return nil, fmt.Errorf("post Linear change comments: %w", err)
+	// Same partial-decode reasoning as CreateIssues: comments that posted are
+	// already visible on the issue, so only the aliases that actually failed may
+	// be retried.
+	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+		if len(resp) == 0 {
+			return nil, fmt.Errorf("post Linear change comments: %w", execErr)
+		}
+		c.log.Warn("Linear comment batch reported errors for some entries; the rest were posted",
+			slog.Int("aliases_returned", len(resp)),
+			slog.Int("batch_size", len(jobs)),
+			slog.Any("error", execErr),
+		)
 	}
 
 	var failed []int

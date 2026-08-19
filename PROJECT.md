@@ -168,7 +168,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states as follows:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
-- `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (SLA measured from the acceptance expiry, so the issue is already due)
+- `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (due date is the acceptance expiry plus the configured severity offset)
 - `accepted` without an `expiration_date` (permanent risk acceptance) -> `Cancelled`
 - `invalid` (false positive) -> `Cancelled`
 - `fixed` -> `Done`
@@ -192,8 +192,10 @@ all is treated as permanent.
 Archived Linear issues are a special case. Linear auto-archives closed issues
 and excludes them from the default issue query, while Snyk DAST retains
 terminal findings indefinitely, so the sync must ask for archived issues
-explicitly (bounded by `LINEAR_ARCHIVE_LOOKBACK_DAYS`) or it would recreate a
-duplicate for every closed finding on every run. Archived issues are treated as
+explicitly (bounded by `LINEAR_ARCHIVE_LOOKBACK_DAYS`) or it recreates a
+duplicate each time a ticket leaves the snapshot — once per archive cycle rather
+than on every run, since each replacement is visible until Linear archives it in
+turn. Archived issues are treated as
 terminal and are not mutated in place; a finding that becomes active again gets
 a replacement ticket.
 
@@ -203,9 +205,13 @@ updating the original ticket is a supported alternative. It was considered and
 rejected — each recurrence is intended to get a clean ticket with its own SLA
 clock rather than one ticket reused across recurrences.
 
-The lookback window bounds elapsed time since archiving, not the team's
+The lookback window bounds elapsed time since **auto-**archiving, not the team's
 auto-archive period (which Linear expresses in months). The two are
-independent, so a short window is not made safe by a short period.
+independent, so a short window is not made safe by a short period. It also does
+not bound every archived issue: manually or API-archived issues (trashed ones
+included) have `archivedAt` set with `autoArchivedAt` null, so they are returned
+regardless of age. Including them can only prevent duplicates, and the pinned
+`linear-api` binding has no `IssueFilter.archivedAt` to bound them with.
 
 Since Snyk DAST retains terminal findings indefinitely, each keeps a live
 desired issue forever, and any finite window eventually drops its ticket from

@@ -715,3 +715,84 @@ func TestCreateIssuesReportsOnlyFailedIndices(t *testing.T) {
 		t.Fatalf("failed indices = %#v, want [1]", failed)
 	}
 }
+
+// TestCreateIssuesKeepsPartialDataOnGraphQLError is the regression test for the
+// duplicate path CodeRabbit caught. gqlclient decodes the response body into the
+// out param BEFORE returning joinErrors(...), so a mutation that errored for one
+// alias still leaves the successful aliases decoded. Reporting a batch error and
+// discarding them makes the caller recreate everything that already succeeded.
+func TestCreateIssuesKeepsPartialDataOnGraphQLError(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Entries 0 and 2 created; entry 1 failed with a GraphQL error.
+				// Linear returns both data and errors in this situation.
+				return jsonResponse(t, `{
+					"data":{
+						"issueCreate0":{"success":true,"issue":{"id":"i0","identifier":"SEC-1"}},
+						"issueCreate2":{"success":true,"issue":{"id":"i2","identifier":"SEC-3"}}
+					},
+					"errors":[{"message":"Entity not found: WorkflowState"}]
+				}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{
+		{Fingerprint: "f0", Title: "a", State: model.StateTodo},
+		{Fingerprint: "f1", Title: "b", State: model.StateTodo},
+		{Fingerprint: "f2", Title: "c", State: model.StateTodo},
+	}
+	failed, err := client.CreateIssues(context.Background(), desired)
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil: partial data must not be discarded, "+
+			"otherwise the caller recreates the two issues that succeeded", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
+	}
+}
+
+// TestCreateIssuesReturnsErrorWhenNoAliasesDecoded confirms the other side: with
+// no per-alias outcome at all, the error must surface so the caller retries
+// everything individually.
+func TestCreateIssuesReturnsErrorWhenNoAliasesDecoded(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				return jsonResponse(t, `{"errors":[{"message":"Query validation failed"}]}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{{Fingerprint: "f0", Title: "a", State: model.StateTodo}}
+	if _, err := client.CreateIssues(context.Background(), desired); err == nil {
+		t.Fatal("CreateIssues() error = nil, want an error when no alias outcome is known")
+	}
+}

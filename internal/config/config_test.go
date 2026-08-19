@@ -128,3 +128,63 @@ func TestLoadRejectsMalformedTargetTypeLabels(t *testing.T) {
 		t.Fatal("Load() error = nil, want parse error")
 	}
 }
+
+// minimalValidConfig returns a Config that passes Validate, so a test can vary a
+// single field and attribute any error to that field.
+func minimalValidConfig() Config {
+	return Config{
+		Log:   LogConfig{ErrorFile: "errors.log"},
+		Cache: CacheConfig{DBFile: "cache.db"},
+		SnykDAST: SnykDASTConfig{
+			APIKey:  "api-key",
+			APIBase: defaultSnykDASTAPIBase,
+			AppBase: defaultSnykDASTAppBase,
+		},
+		Linear: LinearConfig{
+			APIKey:              "linear-key",
+			TeamID:              "team-id",
+			ArchiveLookbackDays: defaultArchiveLookbackDays,
+			Due: DueDateConfig{
+				CriticalDays: defaultCriticalDueDays,
+				HighDays:     defaultHighDueDays,
+				MediumDays:   defaultMediumDueDays,
+				LowDays:      defaultLowDueDays,
+			},
+		},
+		Sync: SyncConfig{
+			Workers:             defaultWorkerCount,
+			SnykDASTConcurrency: defaultSnykDASTConcurrency,
+			LinearConcurrency:   defaultLinearConcurrency,
+		},
+	}
+}
+
+func TestValidateRejectsOverflowingArchiveLookback(t *testing.T) {
+	// A day count above ~106751 overflows the nanosecond time.Duration used to
+	// compute the archive cutoff, which would silently exclude every archived
+	// issue rather than including more of them.
+	cases := []struct {
+		name    string
+		days    int
+		wantErr bool
+	}{
+		{"zero is rejected", 0, true},
+		{"negative is rejected", -1, true},
+		{"default is accepted", 3650, false},
+		{"maximum is accepted", 106751, false},
+		{"one past maximum is rejected", 106752, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			cfg.Linear.ArchiveLookbackDays = tc.days
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("Validate() error = nil, want an error for %d days", tc.days)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Validate() error = %v, want nil for %d days", err, tc.days)
+			}
+		})
+	}
+}

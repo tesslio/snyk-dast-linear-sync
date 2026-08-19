@@ -49,6 +49,13 @@ const (
 	// unbounded. It stays configurable purely as a size/latency escape hatch:
 	// lowering it trades duplicate-freedom for a smaller snapshot on each run.
 	defaultArchiveLookbackDays = 3650
+
+	// maxArchiveLookbackDays is the largest value that survives conversion to a
+	// 24-hour time.Duration. math.MaxInt64 nanoseconds is ~106751.99 days, so a
+	// larger value overflows and yields a nonsense (possibly future) archive
+	// cutoff, which would silently exclude every archived issue and bring the
+	// duplicate-creation bug straight back.
+	maxArchiveLookbackDays = 106751
 )
 
 type Config struct {
@@ -227,6 +234,8 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.ArchiveLookbackDays <= 0 {
 		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
+	} else if c.Linear.ArchiveLookbackDays > maxArchiveLookbackDays {
+		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be <= %d (a larger value overflows time.Duration), got %d", maxArchiveLookbackDays, c.Linear.ArchiveLookbackDays))
 	}
 	if strings.TrimSpace(c.Log.ErrorFile) == "" {
 		errs = append(errs, errors.New("ERROR_LOG_FILE must not be empty"))

@@ -263,7 +263,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` -> `Todo` (SLA from acceptance expiry)
-- `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; SLA from acceptance expiry, so the issue is due immediately). A date-only `expiration_date` covers the whole of that day, so the acceptance lapses at the end of it, not at midnight.
+- `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; the due date is the acceptance expiry plus the configured severity offset, the same basis used while the acceptance was in force). A date-only `expiration_date` covers the whole of that day, so the acceptance lapses at the end of it, not at midnight.
 - `accepted` without an `expiration_date` -> `Cancelled`
 - `invalid` -> `Cancelled`
 - `fixed` -> `Done`
@@ -291,9 +291,11 @@ Terminal states (`Done`, `Cancelled`) are never preserved — the sync always tr
 Linear auto-archives closed issues after the team's configured inactivity
 period, and archived issues are excluded from Linear's default issue query.
 Snyk DAST keeps `fixed`, `accepted`, and `invalid` findings in its API
-indefinitely, so if the sync could not see its own archived tickets it would
-consider them missing and create a fresh duplicate for every closed finding on
-every run.
+indefinitely, so if the sync cannot see its own archived tickets it considers
+them missing and creates a fresh duplicate. The replacement is itself visible
+until Linear archives it in turn, at which point the finding looks ticketless
+again — so the duplication repeats once per archive cycle rather than on every
+run, and the copies accumulate.
 
 The issue snapshot therefore requests archived issues explicitly, bounded to
 those auto-archived within `LINEAR_ARCHIVE_LOOKBACK_DAYS` (default 3650 — ten
@@ -309,10 +311,18 @@ clock, rather than one ticket reused indefinitely across recurrences.
 
 #### Why the window is effectively unbounded
 
-`LINEAR_ARCHIVE_LOOKBACK_DAYS` bounds how long ago a ticket was archived — not
-how long your team's auto-archive period is. Linear expresses that period in
-*months* (`Team.autoArchivePeriod`), and the two values are independent: a short
-window is not made safe by a short period.
+`LINEAR_ARCHIVE_LOOKBACK_DAYS` bounds how long ago a ticket was **auto-archived**
+— not how long your team's auto-archive period is. Linear expresses that period
+in *months* (`Team.autoArchivePeriod`), and the two values are independent: a
+short window is not made safe by a short period.
+
+The window applies only to auto-archived issues, because it filters on
+`autoArchivedAt`. Issues archived manually or through the API — including
+trashed (deleted) ones — carry `archivedAt` without `autoArchivedAt`, so they
+match the not-auto-archived filter arms and are returned regardless of age. That
+is deliberate: including them can only prevent duplicates, never cause them, and
+the pinned `linear-api` binding predates `IssueFilter.archivedAt` so bounding
+them is not expressible today.
 
 Because Snyk DAST retains `fixed`, `accepted`, and `invalid` findings
 indefinitely, each of them keeps a live desired issue forever. So any *finite*
