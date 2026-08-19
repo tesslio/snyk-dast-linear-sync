@@ -12,7 +12,7 @@ import (
 
 	"log/slog"
 
-	"github.com/RichardoC/snyk-dast-linear-sync/internal/model"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 	"golang.org/x/sync/errgroup"
 )
 

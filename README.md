@@ -6,7 +6,7 @@ an official integration.
 Repo:
 
 ```text
-github.com/RichardoC/snyk-dast-linear-sync
+github.com/tesslio/snyk-dast-linear-sync
 ```
 
 ## What It Does
@@ -36,13 +36,13 @@ Quickstart without cloning:
 Create a local `.env`, then run directly with the repo path:
 
 ```bash
-go run github.com/RichardoC/snyk-dast-linear-sync/cmd/snyk-dast-linear-sync@latest --env-file .env --dry-run
+go run github.com/tesslio/snyk-dast-linear-sync/cmd/snyk-dast-linear-sync@latest --env-file .env --dry-run
 ```
 
 Or install the binary:
 
 ```bash
-go install github.com/RichardoC/snyk-dast-linear-sync/cmd/snyk-dast-linear-sync@latest
+go install github.com/tesslio/snyk-dast-linear-sync/cmd/snyk-dast-linear-sync@latest
 snyk-dast-linear-sync --env-file .env --dry-run
 ```
 

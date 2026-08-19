@@ -7,7 +7,7 @@ This project exists to keep Linear aligned with Snyk DAST.
 Canonical module path:
 
 ```text
-github.com/RichardoC/snyk-dast-linear-sync
+github.com/tesslio/snyk-dast-linear-sync
 ```
 
 Snyk DAST is the rebrand of Probely. The tool talks to the Probely REST API
