@@ -296,8 +296,8 @@ consider them missing and create a fresh duplicate for every closed finding on
 every run.
 
 The issue snapshot therefore requests archived issues explicitly, bounded to
-those auto-archived within `LINEAR_ARCHIVE_LOOKBACK_DAYS` (default 35) to keep
-the snapshot size manageable. The sync treats archived issues as terminal and
+those auto-archived within `LINEAR_ARCHIVE_LOOKBACK_DAYS` (default 3650 — ten
+years, i.e. effectively the whole archive). The sync treats archived issues as terminal and
 does not update, resolve, or cancel them in place. If a finding whose ticket has
 been archived becomes active again, a replacement ticket is created.
 
@@ -307,30 +307,36 @@ restoring the original ticket and updating it would be possible. That path was
 considered and not taken: each recurrence gets a clean ticket with its own SLA
 clock, rather than one ticket reused indefinitely across recurrences.
 
-#### Known limitation
+#### Why the window is effectively unbounded
 
-`LINEAR_ARCHIVE_LOOKBACK_DAYS` bounds how long ago a ticket was archived, not
-how long your team's auto-archive period is (Linear expresses that period in
-*months*). A ticket archived longer ago than the window drops out of the
-snapshot. Because Snyk DAST retains `fixed`, `accepted`, and `invalid` findings
-indefinitely, such a finding then looks ticketless again and a duplicate closed
-ticket can be created — once per archive cycle rather than every run.
+`LINEAR_ARCHIVE_LOOKBACK_DAYS` bounds how long ago a ticket was archived — not
+how long your team's auto-archive period is. Linear expresses that period in
+*months* (`Team.autoArchivePeriod`), and the two values are independent: a short
+window is not made safe by a short period.
 
-This is an accepted trade-off. The alternative — not creating tickets for
-findings that are already terminal and have no ticket — was considered and
-rejected: every Snyk DAST finding should end up with a Linear ticket, including
-findings that were already closed before the sync first ran, so the ticket
-history is complete.
+Because Snyk DAST retains `fixed`, `accepted`, and `invalid` findings
+indefinitely, each of them keeps a live desired issue forever. So any *finite*
+window eventually drops the ticket out of the snapshot, the finding looks
+ticketless, and a duplicate closed ticket is created. Worse, the copies do not
+converge: the original is no longer visible, so the duplicate-cancellation pass
+cannot pair them up, and one extra closed ticket accumulates per cycle.
 
-Note that the duplicates do not converge on their own. Once the original ticket
-is past the window it is absent from the snapshot, so the duplicate-cancellation
-pass cannot see it and the copies simply accumulate — roughly one extra closed
-ticket per archive cycle per permanently-terminal finding.
+Worked example with a one-month auto-archive period and a 35-day window: the
+ticket archives ~30 days after closing, stays visible for 35 more days, and is
+recreated at roughly day 65 — then that copy repeats the cycle. About one
+spurious ticket every two months, per permanently-terminal finding, forever.
 
-Raising `LINEAR_ARCHIVE_LOOKBACK_DAYS` reduces how often this happens, and a
-window long enough to cover all archived managed tickets prevents it outright,
-at the cost of a larger snapshot on every run. Weigh that against Linear's
-query-complexity and rate limits if you have a large closed backlog.
+Hence the ten-year default, which covers the whole archive in practice. The
+setting remains configurable purely as a size/latency escape hatch: lowering it
+shrinks the snapshot and speeds up each run, at the cost of reintroducing the
+cycle above. The snapshot query pages 100 issues at a time and costs roughly
+6,300 of Linear's 10,000 per-query complexity points, so widening the window
+costs extra pages rather than risking a rejected query.
+
+The alternative fix — not creating tickets for findings that are already
+terminal and have no ticket — was considered and rejected: every Snyk DAST
+finding should end up with a Linear ticket, including findings closed before the
+sync first ran, so the ticket history is complete.
 
 ### Due Dates
 

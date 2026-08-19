@@ -35,19 +35,20 @@ const (
 	// that Linear has since auto-archived would otherwise look absent and be
 	// recreated.
 	//
-	// Note what this window is and is not. It bounds the time elapsed SINCE
+	// Note what this window is and is not: it bounds the time elapsed SINCE
 	// archiving, not the length of the team's auto-archive period (which Linear
-	// expresses in months, via Team.autoArchivePeriod). A ticket archived longer
-	// ago than this window drops out of the snapshot, so Snyk DAST findings that
-	// stay terminal forever can still have a duplicate minted once the window
-	// passes, and those copies accumulate rather than converging. That is an
-	// accepted trade-off: the project wants every finding to end up with a
-	// ticket, so creates are not suppressed for already-terminal findings.
-	// Raising this far enough to cover the whole archived backlog prevents the
-	// duplication outright, traded against snapshot size and Linear's
-	// query-complexity limits. 35 days keeps the snapshot bounded while covering
-	// the recently-archived tickets that churn most.
-	defaultArchiveLookbackDays = 35
+	// expresses in months, via Team.autoArchivePeriod). The two are independent,
+	// and a short window is not made safe by a short period.
+	//
+	// Because Snyk DAST retains fixed/accepted/invalid findings indefinitely,
+	// every one of them keeps a live desired issue forever, so ANY finite window
+	// eventually loses the ticket and mints a duplicate — and since the original
+	// is no longer visible, duplicate cancellation cannot pair them up and the
+	// copies accumulate. Correctness therefore wants the window to cover the
+	// entire archived backlog, which is why the default is effectively
+	// unbounded. It stays configurable purely as a size/latency escape hatch:
+	// lowering it trades duplicate-freedom for a smaller snapshot on each run.
+	defaultArchiveLookbackDays = 3650
 )
 
 type Config struct {

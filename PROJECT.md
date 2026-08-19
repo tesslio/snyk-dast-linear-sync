@@ -204,18 +204,20 @@ rejected — each recurrence is intended to get a clean ticket with its own SLA
 clock rather than one ticket reused across recurrences.
 
 The lookback window bounds elapsed time since archiving, not the team's
-auto-archive period (which Linear expresses in months). A ticket archived
-longer ago than the window leaves the snapshot, so a permanently terminal
-finding can still acquire a duplicate closed ticket once per archive cycle, and
-those copies accumulate rather than converging: the original is no longer
-visible, so duplicate cancellation cannot pair them up.
+auto-archive period (which Linear expresses in months). The two are
+independent, so a short window is not made safe by a short period.
 
-This is accepted deliberately. Suppressing creates for already-terminal
-findings would remove the cycle, but the project wants every finding to end up
-with a ticket, including findings closed before the sync first ran. Raising
-`LINEAR_ARCHIVE_LOOKBACK_DAYS` far enough to cover the whole archived backlog
-prevents the duplication outright, traded against snapshot size and Linear
-query-complexity limits.
+Since Snyk DAST retains terminal findings indefinitely, each keeps a live
+desired issue forever, and any finite window eventually drops its ticket from
+the snapshot — minting a duplicate that cannot be reconciled, because the
+original is no longer visible to the duplicate-cancellation pass. The copies
+therefore accumulate, one per cycle. `LINEAR_ARCHIVE_LOOKBACK_DAYS` defaults to
+ten years for that reason: it covers the whole archive in practice, and remains
+configurable only as a size/latency escape hatch.
+
+Suppressing creates for already-terminal findings would also remove the cycle,
+but was rejected: the project wants every finding to end up with a ticket,
+including findings closed before the sync first ran.
 
 ### Manual Non-Terminal State Override
 

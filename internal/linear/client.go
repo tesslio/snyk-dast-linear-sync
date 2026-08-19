@@ -518,7 +518,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	// LINEAR_ARCHIVE_LOOKBACK_DAYS so the snapshot stays a manageable size.
 	lookbackDays := c.cfg.ArchiveLookbackDays
 	if lookbackDays <= 0 {
-		lookbackDays = 35 // defensive; config.Validate() enforces > 0
+		lookbackDays = 3650 // defensive; config.Validate() enforces > 0
 	}
 	archiveCutoffTime := time.Now().UTC().Add(-time.Duration(lookbackDays) * 24 * time.Hour)
 	archiveCutoff := linearapi.DateTime(archiveCutoffTime.Format(time.RFC3339))
