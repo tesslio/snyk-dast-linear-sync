@@ -70,7 +70,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int64("failed_comments", result.FailedComments),
 	)
 
-	return nil
+	// Checked after the summary log so the counts are always reported, then
+	// surfaced as a non-zero exit so a scheduler or CI job notices that some
+	// work never landed.
+	return result.Err()
 }
 
 func newLogger(cfg config.Config) (*slog.Logger, func() error, error) {
