@@ -193,9 +193,21 @@ Archived Linear issues are a special case. Linear auto-archives closed issues
 and excludes them from the default issue query, while Snyk DAST retains
 terminal findings indefinitely, so the sync must ask for archived issues
 explicitly (bounded by `LINEAR_ARCHIVE_LOOKBACK_DAYS`) or it would recreate a
-duplicate for every closed finding on every run. Archived issues cannot be
-mutated, so they are never updated, resolved, or cancelled; a finding that
-becomes active again gets a replacement ticket instead of a reopened one.
+duplicate for every closed finding on every run. Archived issues are treated as
+terminal and are not mutated in place; a finding that becomes active again gets
+a replacement ticket.
+
+The replacement is a product choice, not an API constraint: Linear's
+`issueUnarchive` mutation carries no documented precondition, so restoring and
+updating the original ticket is a supported alternative that would keep one
+ticket per recurring finding.
+
+The lookback window bounds elapsed time since archiving, not the team's
+auto-archive period (which Linear expresses in months). A ticket archived
+longer ago than the window leaves the snapshot, so a permanently terminal
+finding can still acquire a duplicate closed ticket once per archive cycle.
+Widening the window defers that; eliminating it means not creating tickets for
+findings that are already terminal and have no ticket.
 
 ### Manual Non-Terminal State Override
 

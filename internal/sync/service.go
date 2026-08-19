@@ -219,13 +219,20 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 				continue
 			}
-			// Linear cannot mutate an auto-archived issue. If the finding is
-			// still closed on the Snyk DAST side, the archived ticket already
-			// records that and there is nothing to do — this is what stops the
-			// sync from minting a fresh duplicate for every archived ticket on
-			// every run. If the finding has come back (desired state is open
-			// again), the archived ticket cannot be reopened, so a replacement
-			// ticket is created instead.
+			// If the finding is still closed on the Snyk DAST side, the archived
+			// ticket already records that and there is nothing to do — this is
+			// what stops the sync from minting a fresh duplicate for every
+			// archived ticket on every run.
+			//
+			// If the finding has come back (desired state is open again), this
+			// creates a replacement ticket rather than reopening the archived
+			// one. That is a deliberate choice, not an API limitation: Linear
+			// does expose issueUnarchive(id), which has no documented
+			// precondition and would let the original ticket be restored and
+			// updated, preserving its history and comments. Switching to
+			// unarchive-then-update is a viable alternative if keeping one
+			// ticket per recurring finding is preferred over a fresh ticket per
+			// recurrence.
 			if existing.ArchivedAt != nil {
 				if isNonTerminalModelState(desired.State) {
 					s.logger.Info("archived Linear issue cannot be reopened, creating a replacement",
@@ -275,8 +282,8 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
-			// Archived issues are already terminal and cannot be mutated;
-			// attempting to resolve them would only produce API errors.
+			// Archived issues are treated as terminal and are not mutated in
+			// place; restoring one would require issueUnarchive first.
 			if existing.ArchivedAt != nil {
 				continue
 			}

@@ -297,14 +297,30 @@ every run.
 
 The issue snapshot therefore requests archived issues explicitly, bounded to
 those auto-archived within `LINEAR_ARCHIVE_LOOKBACK_DAYS` (default 35) to keep
-the snapshot size manageable. Archived issues cannot be mutated through the
-API, so the sync never tries to update, resolve, or cancel them. If a finding
-whose ticket has been archived becomes active again, the archived ticket cannot
-be reopened, so a replacement ticket is created instead.
+the snapshot size manageable. The sync treats archived issues as terminal and
+does not update, resolve, or cancel them in place. If a finding whose ticket has
+been archived becomes active again, a replacement ticket is created.
 
-Tickets archived longer ago than the lookback window fall outside the snapshot.
-Widen `LINEAR_ARCHIVE_LOOKBACK_DAYS` if your team's auto-archive period is
-longer than the default.
+Creating a replacement is a deliberate choice rather than an API limitation.
+Linear exposes an `issueUnarchive` mutation with no documented precondition, so
+restoring the original ticket and updating it is possible; that would preserve
+the ticket's history and comments at the cost of reusing one ticket across
+recurrences. Switch to unarchive-then-update if that trade is preferable.
+
+#### Known limitation
+
+`LINEAR_ARCHIVE_LOOKBACK_DAYS` bounds how long ago a ticket was archived, not
+how long your team's auto-archive period is (Linear expresses that period in
+*months*). A ticket archived longer ago than the window drops out of the
+snapshot. Because Snyk DAST retains `fixed`, `accepted`, and `invalid` findings
+indefinitely, such a finding then looks ticketless again and a duplicate closed
+ticket can be created — once per archive cycle rather than every run.
+
+Widening the window defers this rather than preventing it. The structural fix is
+to not create tickets for findings that are already terminal and have no ticket
+at all, since a closed ticket for a finding the team never triaged carries
+little value; that changes which tickets get created, so it is deliberately not
+bundled in here.
 
 ### Due Dates
 

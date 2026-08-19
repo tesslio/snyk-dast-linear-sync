@@ -29,12 +29,21 @@ const (
 	defaultErrorLogFile         = "logs/snyk-dast-linear-sync-errors.log"
 	defaultCacheDBFile          = "data/snyk-dast-linear-sync-cache.db"
 
-	// defaultArchiveLookbackDays is the lookback window for including
-	// auto-archived Linear issues in the snapshot. Linear excludes archived
-	// issues from the default issues query, so a closed managed ticket that
-	// Linear has since auto-archived would otherwise look absent and be
-	// recreated on every run. 35 days (5 weeks) covers the common
-	// auto-archive period with margin while keeping the snapshot bounded.
+	// defaultArchiveLookbackDays bounds how long ago an issue may have been
+	// auto-archived and still be pulled into the snapshot. Linear excludes
+	// archived issues from the default issues query, so a closed managed ticket
+	// that Linear has since auto-archived would otherwise look absent and be
+	// recreated.
+	//
+	// Note what this window is and is not. It bounds the time elapsed SINCE
+	// archiving, not the length of the team's auto-archive period (which Linear
+	// expresses in months, via Team.autoArchivePeriod). A ticket archived longer
+	// ago than this window drops out of the snapshot, so Snyk DAST findings that
+	// stay terminal forever can still have a duplicate minted once the window
+	// passes. Widening the window defers that, it does not prevent it; the
+	// structural fix is to not create tickets for findings that are already
+	// terminal and have no ticket at all. 35 days keeps the snapshot bounded
+	// while covering the recently-archived tickets that churn most.
 	defaultArchiveLookbackDays = 35
 )
 

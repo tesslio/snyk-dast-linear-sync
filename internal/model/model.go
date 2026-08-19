@@ -109,11 +109,12 @@ type ExistingIssue struct {
 	ManagedLabels []string
 	Labels        []IssueLabel
 	Priority      int
-	// ArchivedAt is non-nil when Linear has auto-archived the issue. Archived
-	// issues are excluded from Linear's default issues query, so the sync asks
-	// for them explicitly (includeArchived: true, bounded by
+	// ArchivedAt is non-nil when Linear has archived the issue. Archived issues
+	// are excluded from Linear's default issues query, so the sync asks for them
+	// explicitly (includeArchived: true, bounded by
 	// LINEAR_ARCHIVE_LOOKBACK_DAYS) to avoid recreating tickets that already
-	// exist. They are always terminal and cannot be mutated via the API.
+	// exist. The sync treats them as terminal and does not mutate them in
+	// place; Linear's issueUnarchive would have to restore one first.
 	ArchivedAt *time.Time
 }
 

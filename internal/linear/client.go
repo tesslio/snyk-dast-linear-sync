@@ -535,7 +535,11 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 		},
 		Or: []linearapi.IssueFilter{
 			{
-				// Live issues matching the managed title prefix.
+				// Not auto-archived, matching the managed title prefix. Note
+				// this arm also matches issues archived manually or via the API
+				// (including trashed ones): those have archivedAt set but
+				// autoArchivedAt null. They are detected by reading archivedAt
+				// back off the issue, not by this filter.
 				Title: &linearapi.StringComparator{
 					StartsWith: new(titlePrefix),
 				},
@@ -544,7 +548,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 				},
 			},
 			{
-				// Live issues carrying the managed metadata block.
+				// Not auto-archived, carrying the managed metadata block.
 				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
 				},
