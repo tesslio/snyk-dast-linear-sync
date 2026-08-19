@@ -48,6 +48,12 @@ type fakeLinear struct {
 	landedFingerprints []string
 	existingErr        error
 	existingCalls      int
+
+	// commentBatchErr makes the batch PostComments call fail with an error,
+	// simulating an ambiguous outcome. commentCalls records the size of every
+	// PostComments call so a test can assert no retry happened.
+	commentBatchErr error
+	commentCalls    []int
 }
 
 type fakeCache struct {
@@ -113,6 +119,12 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 }
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
+	f.commentCalls = append(f.commentCalls, len(updates))
+	if f.commentBatchErr != nil {
+		err := f.commentBatchErr
+		f.commentBatchErr = nil
+		return nil, err
+	}
 	f.comments = append(f.comments, updates...)
 	if f.commentFailIdx != nil {
 		failed := f.commentFailIdx
@@ -2027,4 +2039,70 @@ func desiredFingerprints(desired []model.DesiredIssue) []string {
 		out = append(out, d.Fingerprint)
 	}
 	return out
+}
+
+// TestRunCountsAmbiguousCommentBatchWithoutRetrying covers the comment half of
+// the ambiguous-outcome handling. A comment carries no fingerprint to reconcile
+// against, so retrying risks posting it twice while the issue state is already
+// correct. The batch is therefore counted and not retried.
+func TestRunCountsAmbiguousCommentBatchWithoutRetrying(t *testing.T) {
+	cfg := baseTestConfig()
+	cfg.Linear.CommentsEnabled = true
+
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       model.Fingerprint("target-a", "su2d3k-1"),
+					SnykDASTFindingID: "su2d3k-1",
+					TargetID:          "target-a",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+				},
+			},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	// An existing issue with a stale title, so the finding produces an update and
+	// therefore a change comment.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Triage",
+				Fingerprint: model.Fingerprint("target-a", "su2d3k-1"),
+			},
+		},
+		commentBatchErr: errors.New("connection reset by peer"),
+	}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (the update itself must still apply)", result.PlannedUpdates)
+	}
+	// The batch is counted, not silently dropped.
+	if result.FailedComments != 1 {
+		t.Fatalf("FailedComments = %d, want 1 (the size of the ambiguous batch)", result.FailedComments)
+	}
+	// Exactly one PostComments call: the batch. A retry would risk duplicating a
+	// comment that may already have posted.
+	if len(linear.commentCalls) != 1 {
+		t.Fatalf("PostComments calls = %#v, want exactly one batch call and no retry", linear.commentCalls)
+	}
+	if len(linear.comments) != 0 {
+		t.Fatalf("comments recorded = %d, want 0: the batch call failed", len(linear.comments))
+	}
+	// A failed comment must not be recorded as a failed sync operation — the
+	// issue state itself applied correctly.
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: a comment failure is not a state-sync failure", result.FailedOps)
+	}
 }
