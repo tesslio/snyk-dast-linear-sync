@@ -2,6 +2,7 @@ package linear
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -563,5 +564,154 @@ func TestBuildChangeCommentReturnsEmptyWhenDiffIsNil(t *testing.T) {
 
 	if comment != "" {
 		t.Fatalf("expected empty comment when diff is nil, got: %s", comment)
+	}
+}
+
+// TestLoadIssuesRequestsArchivedIssues guards the fix for closed managed
+// tickets disappearing from the snapshot. Linear excludes auto-archived issues
+// from the default issues query, and Snyk DAST keeps fixed/accepted findings in
+// its API indefinitely, so without includeArchived the sync stops seeing its own
+// closed tickets and mints a fresh duplicate for each of them on every run.
+//
+// It also pins the AutoArchivedAt.Null boolean. Per Linear's
+// NullableDateComparator, "null: true" matches records where the field IS null
+// (i.e. NOT archived) while "null: false" matches non-null values (archived).
+// Inverting it would make the live-issue clauses match only archived tickets.
+func TestLoadIssuesRequestsArchivedIssues(t *testing.T) {
+	var capturedQuery string
+	var capturedFilter map[string]any
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:              "team-1",
+			ArchiveLookbackDays: 21,
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				if filter, ok := payload.Variables["filter"].(map[string]any); ok {
+					capturedFilter = filter
+				}
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.loadIssues(context.Background()); err != nil {
+		t.Fatalf("loadIssues() error = %v", err)
+	}
+
+	if !strings.Contains(capturedQuery, "includeArchived: true") {
+		t.Fatalf("issues query must pass includeArchived: true, got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, "archivedAt") {
+		t.Fatalf("issues query must select archivedAt, got:\n%s", capturedQuery)
+	}
+
+	clauses, ok := capturedFilter["or"].([]any)
+	if !ok {
+		t.Fatalf("filter must carry an OR clause list, got: %#v", capturedFilter)
+	}
+	if len(clauses) != 4 {
+		t.Fatalf("OR clauses = %d, want 4 (title/description x live/archived)", len(clauses))
+	}
+
+	nullTrue, gte := 0, 0
+	for _, raw := range clauses {
+		clause, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause is not an object: %#v", raw)
+		}
+		archived, ok := clause["autoArchivedAt"].(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause missing autoArchivedAt: %#v", clause)
+		}
+		if val, has := archived["null"]; has {
+			isNull, ok := val.(bool)
+			if !ok || !isNull {
+				t.Fatalf("autoArchivedAt.null = %#v, want true (matches NOT-archived issues)", val)
+			}
+			nullTrue++
+			continue
+		}
+		if val, has := archived["gte"]; has {
+			cutoff, ok := val.(string)
+			if !ok || cutoff == "" {
+				t.Fatalf("autoArchivedAt.gte = %#v, want a non-empty cutoff timestamp", val)
+			}
+			gte++
+			continue
+		}
+		t.Fatalf("autoArchivedAt has neither null nor gte: %#v", archived)
+	}
+	if nullTrue != 2 {
+		t.Fatalf("clauses with autoArchivedAt.null=true = %d, want 2", nullTrue)
+	}
+	if gte != 2 {
+		t.Fatalf("clauses with autoArchivedAt.gte = %d, want 2", gte)
+	}
+}
+
+// TestCreateIssuesReportsOnlyFailedIndices pins the partial-failure contract:
+// a per-alias failure must be reported as an index, not as a batch-wide error,
+// so the caller retries just that entry instead of duplicating the rest.
+func TestCreateIssuesReportsOnlyFailedIndices(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if !strings.Contains(string(body), "mutation issueCreateBatch") {
+					t.Fatalf("unexpected request body: %s", body)
+				}
+				// Entry 1 fails; entries 0 and 2 are created.
+				return jsonResponse(t, `{"data":{
+					"issueCreate0":{"success":true,"issue":{"id":"i0","identifier":"SEC-1"}},
+					"issueCreate1":{"success":false,"issue":{"id":"","identifier":""}},
+					"issueCreate2":{"success":true,"issue":{"id":"i2","identifier":"SEC-3"}}
+				}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{
+		{Fingerprint: "f0", Title: "a", State: model.StateTodo},
+		{Fingerprint: "f1", Title: "b", State: model.StateTodo},
+		{Fingerprint: "f2", Title: "c", State: model.StateTodo},
+	}
+	failed, err := client.CreateIssues(context.Background(), desired)
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil: a per-alias failure must not fail the batch", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
 	}
 }

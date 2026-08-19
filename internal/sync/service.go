@@ -23,9 +23,12 @@ type SnykDASTClient interface {
 
 type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
-	CreateIssues(ctx context.Context, desired []model.DesiredIssue) error
+	// CreateIssues returns the indices of entries that failed so the caller can
+	// retry only those; a non-nil error means no per-entry outcome is known.
+	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
-	PostComments(ctx context.Context, updates []model.IssueUpdate) error
+	// PostComments returns the indices (into updates) whose comment failed.
+	PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error)
 }
 
 type CacheStore interface {
@@ -131,11 +134,8 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	for _, issue := range existingIssues {
 		if issue.Fingerprint != "" {
 			if prior, exists := existingByFingerprint[issue.Fingerprint]; exists {
-				canonical, duplicate := prior, issue
-				if identifierNum(issue.Identifier) < identifierNum(prior.Identifier) {
-					canonical, duplicate = issue, prior
-				}
-				s.logger.Warn("duplicate fingerprint found on Linear issues, will cancel higher-identifier copy",
+				canonical, duplicate := preferCanonicalDuplicate(prior, issue, s.cfg.Linear.States)
+				s.logger.Warn("duplicate fingerprint found on Linear issues, will cancel the non-canonical copy",
 					slog.String("fingerprint", issue.Fingerprint),
 					slog.String("canonical", canonical.Identifier),
 					slog.String("duplicate", duplicate.Identifier),
@@ -168,7 +168,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// state already matches the configured state, avoiding false-positive
 			// state-change detection due to model state names ("todo") differing
 			// from configured Linear state names ("Triage").
-			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) {
+			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) && existing.ArchivedAt == nil {
 				desired.PreserveState = true
 			}
 		}
@@ -219,6 +219,29 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 				continue
 			}
+			// Linear cannot mutate an auto-archived issue. If the finding is
+			// still closed on the Snyk DAST side, the archived ticket already
+			// records that and there is nothing to do — this is what stops the
+			// sync from minting a fresh duplicate for every archived ticket on
+			// every run. If the finding has come back (desired state is open
+			// again), the archived ticket cannot be reopened, so a replacement
+			// ticket is created instead.
+			if existing.ArchivedAt != nil {
+				if isNonTerminalModelState(desired.State) {
+					s.logger.Info("archived Linear issue cannot be reopened, creating a replacement",
+						slog.String("issue", existing.Identifier),
+						slog.String("fingerprint", fingerprint),
+						slog.String("desired_state", string(desired.State)),
+					)
+					createBatch = append(createBatch, desired)
+					if len(createBatch) == createBatchSize {
+						jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+						s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
+						createBatch = createBatch[:0]
+					}
+				}
+				continue
+			}
 			// The cache fast-path may not suppress a pending move into a terminal
 			// state: a finding that became fixed/ignored (desired Done/Cancelled)
 			// while its ticket sat in an open column must still be closed, even
@@ -252,6 +275,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
+			// Archived issues are already terminal and cannot be mutated;
+			// attempting to resolve them would only produce API errors.
+			if existing.ArchivedAt != nil {
+				continue
+			}
 			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykdastSnapshot.TargetIDs, snykdastSnapshot.InactiveTargetIDs)
 			resolved := model.DesiredIssue{
 				Fingerprint:   existing.Fingerprint,
@@ -281,6 +309,10 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		cancelBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for _, duplicate := range duplicatesToCancel {
+			// An archived duplicate is already closed and immutable.
+			if duplicate.ArchivedAt != nil {
+				continue
+			}
 			desired := model.DesiredIssue{
 				Fingerprint:   duplicate.Fingerprint,
 				Title:         duplicate.Title,
@@ -386,13 +418,34 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 		if s.cfg.DryRun {
 			return nil
 		}
-		if err := s.linear.CreateIssues(ctx, job.desiredBatch); err != nil {
+		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
+		switch {
+		case err != nil:
+			// No per-alias outcome is known (e.g. a transport failure), so every
+			// entry has to be retried individually.
 			s.logger.Warn("batch create failed, retrying issues individually",
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
 			for _, desired := range job.desiredBatch {
-				if err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+					atomic.AddInt64(&result.FailedOps, 1)
+					s.logger.Error("failed to create issue",
+						slog.String("fingerprint", desired.Fingerprint),
+						slog.Any("error", err),
+					)
+				}
+			}
+		case len(failedIdx) > 0:
+			// Partial failure: only the reported entries still need creating.
+			// Retrying the whole batch would duplicate the ones that succeeded.
+			s.logger.Warn("batch create partially failed, retrying only the failed issues",
+				slog.Int("failed_count", len(failedIdx)),
+				slog.Int("batch_size", len(job.desiredBatch)),
+			)
+			for _, idx := range failedIdx {
+				desired := job.desiredBatch[idx]
+				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
@@ -437,13 +490,32 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				}
 			}
 		} else if s.cfg.Linear.CommentsEnabled {
-			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+			failedIdx, err := s.linear.PostComments(ctx, job.updateBatch)
+			switch {
+			case err != nil:
 				s.logger.Warn("batch comment post failed, retrying individually",
 					slog.Int("batch_size", len(job.updateBatch)),
 					slog.Any("error", err),
 				)
 				for _, update := range job.updateBatch {
-					if err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+						s.logger.Warn("failed to post change comment",
+							slog.String("issue", update.Existing.Identifier),
+							slog.String("fingerprint", update.Desired.Fingerprint),
+							slog.Any("error", err),
+						)
+					}
+				}
+			case len(failedIdx) > 0:
+				// Retry only the comments that failed, so the ones that already
+				// posted are not duplicated on the issue.
+				s.logger.Warn("batch comment post partially failed, retrying only the failed comments",
+					slog.Int("failed_count", len(failedIdx)),
+					slog.Int("batch_size", len(job.updateBatch)),
+				)
+				for _, idx := range failedIdx {
+					update := job.updateBatch[idx]
+					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),
@@ -891,6 +963,10 @@ func pendingTerminalTransition(existing model.ExistingIssue, desired model.Desir
 	if desired.PreserveState {
 		return false
 	}
+	// An archived issue is already terminal and cannot be mutated.
+	if existing.ArchivedAt != nil {
+		return false
+	}
 	if desired.State != model.StateDone && desired.State != model.StateCancelled {
 		return false
 	}
@@ -1065,6 +1141,37 @@ func isNonTerminalLinearState(stateName string, states config.StateConfig) bool 
 		return false
 	}
 	return true
+}
+
+// isTerminalExistingIssue reports whether an existing Linear issue is terminal:
+// either in the configured Done/Cancelled state, or auto-archived by Linear.
+func isTerminalExistingIssue(existing model.ExistingIssue, states config.StateConfig) bool {
+	if existing.ArchivedAt != nil {
+		return true
+	}
+	return !isNonTerminalLinearState(existing.StateName, states)
+}
+
+// preferCanonicalDuplicate decides which of two Linear issues sharing a
+// fingerprint should be treated as canonical. A non-terminal issue is always
+// preferred over a terminal one (Done/Cancelled, or archived): keeping a
+// closed copy as canonical would cancel the live ticket and then reopen the
+// closed one on the next run, churning state for no reason, and an archived
+// copy cannot be mutated at all. Between two issues of the same class the
+// lower identifier wins, as it is the older ticket.
+func preferCanonicalDuplicate(a, b model.ExistingIssue, states config.StateConfig) (canonical, duplicate model.ExistingIssue) {
+	aTerminal := isTerminalExistingIssue(a, states)
+	bTerminal := isTerminalExistingIssue(b, states)
+	if aTerminal != bTerminal {
+		if aTerminal {
+			return b, a
+		}
+		return a, b
+	}
+	if identifierNum(b.Identifier) < identifierNum(a.Identifier) {
+		return b, a
+	}
+	return a, b
 }
 
 func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {

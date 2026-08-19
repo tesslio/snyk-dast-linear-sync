@@ -67,6 +67,20 @@ jobs:
           go fix ./...
           git diff --exit-code
 
+      - name: Verify go.mod is tidy
+        run: |
+          cp go.mod go.mod.ci-backup
+          cp go.sum go.sum.ci-backup
+          go mod tidy
+          if ! diff -q go.mod go.mod.ci-backup >/dev/null || ! diff -q go.sum go.sum.ci-backup >/dev/null; then
+            echo "go.mod/go.sum are not tidy; run 'go mod tidy' and commit the result:"
+            diff -u go.mod.ci-backup go.mod || true
+            diff -u go.sum.ci-backup go.sum || true
+            rm -f go.mod.ci-backup go.sum.ci-backup
+            exit 1
+          fi
+          rm -f go.mod.ci-backup go.sum.ci-backup
+
       - name: Run go vet
         run: go vet ./...
 

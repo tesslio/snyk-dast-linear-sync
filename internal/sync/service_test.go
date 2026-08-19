@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -28,6 +29,12 @@ type fakeLinear struct {
 	updated  []model.DesiredIssue
 	updates  []model.IssueUpdate
 	comments []model.IssueUpdate
+
+	// createFailIdx/commentFailIdx simulate a partial batch failure: the first
+	// batch call reports these indices as failed, subsequent calls succeed.
+	createFailIdx  []int
+	commentFailIdx []int
+	createCalls    []int
 }
 
 type fakeCache struct {
@@ -39,9 +46,16 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
-func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) error {
+func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
 	f.created = append(f.created, desired...)
-	return nil
+	if f.createFailIdx != nil {
+		f.createCalls = append(f.createCalls, len(desired))
+		failed := f.createFailIdx
+		// Only the first batch call reports failures, so a retry can succeed.
+		f.createFailIdx = nil
+		return failed, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
@@ -52,9 +66,14 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 	return nil
 }
 
-func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) error {
+func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
 	f.comments = append(f.comments, updates...)
-	return nil
+	if f.commentFailIdx != nil {
+		failed := f.commentFailIdx
+		f.commentFailIdx = nil
+		return failed, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeCache) Load(context.Context) (cache.Snapshot, error) {
@@ -1655,5 +1674,191 @@ func TestRunSnoozedFindingStaysOpenWithExtendedDueDate(t *testing.T) {
 	// Due date should be calculated from IgnoreExpiresAt (2026-06-01) + 30 days = 2026-07-01
 	if updated.DueDate != "2026-07-01" {
 		t.Fatalf("updated due date = %q, want %q", updated.DueDate, "2026-07-01")
+	}
+}
+
+// baseTestConfig returns the minimal config the archive/batch tests need.
+func baseTestConfig() config.Config {
+	return config.Config{
+		Linear: config.LinearConfig{
+			ArchiveLookbackDays: 35,
+			States: config.StateConfig{
+				Todo:      "Triage",
+				Backlog:   "Backlog",
+				Done:      "Done",
+				Cancelled: "Canceled",
+			},
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestRunDoesNotRecreateArchivedClosedIssue is the regression test for the
+// duplicate-minting loop: Snyk DAST keeps fixed findings in its API forever, so
+// once Linear auto-archives the ticket the sync must still recognise it rather
+// than create a fresh copy on every run.
+func TestRunDoesNotRecreateArchivedClosedIssue(t *testing.T) {
+	archivedAt := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       "snyk-dast:target-a:finding-1",
+					SnykDASTFindingID: "su2d3k-1",
+					TargetID:          "target-a",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingFixed,
+					CreatedAt:         time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+				},
+			},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Snyk DAST: [high] Reflected XSS",
+				StateName:   "Done",
+				Fingerprint: "snyk-dast:target-a:finding-1",
+				ArchivedAt:  &archivedAt,
+			},
+		},
+	}
+
+	result, err := New(baseTestConfig(), discardLogger(), snykdast, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d (%#v), want 0: an archived closed ticket must not be recreated", len(linear.created), linear.created)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0: archived issues cannot be mutated", len(linear.updated))
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0", result.PlannedResolves)
+	}
+}
+
+// TestRunReplacesArchivedIssueWhenFindingReopens covers the other half: an
+// archived ticket cannot be reopened via the API, so a regressed finding needs a
+// replacement ticket rather than a silently-dropped update.
+func TestRunReplacesArchivedIssueWhenFindingReopens(t *testing.T) {
+	archivedAt := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       "snyk-dast:target-a:finding-1",
+					SnykDASTFindingID: "su2d3k-1",
+					TargetID:          "target-a",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+				},
+			},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Snyk DAST: [high] Reflected XSS",
+				StateName:   "Done",
+				Fingerprint: "snyk-dast:target-a:finding-1",
+				ArchivedAt:  &archivedAt,
+			},
+		},
+	}
+
+	if _, err := New(baseTestConfig(), discardLogger(), snykdast, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1 replacement ticket", len(linear.created))
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0: archived issues cannot be mutated", len(linear.updated))
+	}
+}
+
+// TestRunRetriesOnlyFailedCreates is the regression test for the partial-batch
+// duplicate: when one entry in a batch fails, only that entry may be retried.
+func TestRunRetriesOnlyFailedCreates(t *testing.T) {
+	var findings []model.Finding
+	for i := 1; i <= 3; i++ {
+		findings = append(findings, model.Finding{
+			Fingerprint:       fmt.Sprintf("snyk-dast:target-a:finding-%d", i),
+			SnykDASTFindingID: fmt.Sprintf("su2d3k-%d", i),
+			TargetID:          "target-a",
+			IssueTitle:        "Reflected XSS",
+			Severity:          "high",
+			Status:            model.FindingOpen,
+			CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  findings,
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	// The first batch call reports index 1 as failed; the retry must carry that
+	// one entry only, not all three.
+	linear := &fakeLinear{createFailIdx: []int{1}}
+
+	if _, err := New(baseTestConfig(), discardLogger(), snykdast, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	// created accumulates every entry passed to CreateIssues: 3 from the batch
+	// plus exactly 1 from the retry.
+	if len(linear.created) != 4 {
+		t.Fatalf("created = %d, want 4 (3 in batch + 1 retried); a whole-batch retry would give 6", len(linear.created))
+	}
+	if len(linear.createCalls) != 1 || linear.createCalls[0] != 3 {
+		t.Fatalf("createCalls = %#v, want a single 3-entry batch", linear.createCalls)
+	}
+}
+
+func TestPreferCanonicalDuplicatePrefersLiveTicket(t *testing.T) {
+	states := config.StateConfig{Todo: "Triage", Done: "Done", Cancelled: "Canceled"}
+	archivedAt := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+
+	older := model.ExistingIssue{Identifier: "SEC-1", StateName: "Canceled"}
+	newer := model.ExistingIssue{Identifier: "SEC-9", StateName: "Triage"}
+	canonical, duplicate := preferCanonicalDuplicate(older, newer, states)
+	if canonical.Identifier != "SEC-9" || duplicate.Identifier != "SEC-1" {
+		t.Fatalf("canonical = %q, duplicate = %q; want the live ticket SEC-9 as canonical", canonical.Identifier, duplicate.Identifier)
+	}
+
+	archived := model.ExistingIssue{Identifier: "SEC-1", StateName: "Done", ArchivedAt: &archivedAt}
+	live := model.ExistingIssue{Identifier: "SEC-9", StateName: "Triage"}
+	canonical, _ = preferCanonicalDuplicate(archived, live, states)
+	if canonical.Identifier != "SEC-9" {
+		t.Fatalf("canonical = %q, want SEC-9: an archived copy cannot be canonical", canonical.Identifier)
+	}
+
+	// Same class: the older (lower) identifier wins.
+	a := model.ExistingIssue{Identifier: "SEC-4", StateName: "Triage"}
+	b := model.ExistingIssue{Identifier: "SEC-2", StateName: "Triage"}
+	canonical, duplicate = preferCanonicalDuplicate(a, b, states)
+	if canonical.Identifier != "SEC-2" || duplicate.Identifier != "SEC-4" {
+		t.Fatalf("canonical = %q, duplicate = %q; want SEC-2 canonical", canonical.Identifier, duplicate.Identifier)
 	}
 }

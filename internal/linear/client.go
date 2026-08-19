@@ -48,6 +48,7 @@ type linearIssueNode struct {
 	URL         string  `json:"url"`
 	Priority    int     `json:"priority"`
 	DueDate     *string `json:"dueDate"`
+	ArchivedAt  *string `json:"archivedAt"`
 	State       struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -110,7 +111,7 @@ func (c *Client) LoadIssueByIdentifier(ctx context.Context, identifier string) (
 
 	op := gqlclient.NewOperation(`
 query issueByIdentifier($filter: IssueFilter!) {
-  issues(filter: $filter, first: 1) {
+  issues(filter: $filter, first: 1, includeArchived: true) {
     nodes {
       id
       identifier
@@ -119,6 +120,7 @@ query issueByIdentifier($filter: IssueFilter!) {
       url
       priority
       dueDate
+      archivedAt
       state {
         id
         name
@@ -184,6 +186,12 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 			Name: label.Name,
 		})
 	}
+	var archivedAt *time.Time
+	if issue.ArchivedAt != nil && strings.TrimSpace(*issue.ArchivedAt) != "" {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(*issue.ArchivedAt)); err == nil {
+			archivedAt = &t
+		}
+	}
 	return model.ExistingIssue{
 		ID:            issue.ID,
 		Identifier:    issue.Identifier,
@@ -197,6 +205,7 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		Fingerprint:   extractFingerprint(description),
 		ManagedLabels: extractManagedLabels(description),
 		Labels:        labels,
+		ArchivedAt:    archivedAt,
 	}
 }
 
@@ -229,25 +238,31 @@ func (c *Client) StateID(state model.IssueState) (string, error) {
 	return id, nil
 }
 
-func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) error {
+// CreateIssues creates a batch of Linear issues in one GraphQL mutation. It
+// returns the indices of the entries that failed, so the caller can retry only
+// those: a batch mutation can fail per-alias while the rest succeed, and
+// retrying the whole batch would create duplicate tickets for the entries that
+// were already created. A non-nil error means no per-alias outcome is known
+// (e.g. a transport failure), in which case the returned indices are nil.
+func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	if len(desired) == 0 {
-		return nil
+		return nil, nil
 	}
 	if err := c.resolveTeam(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.ensureStatesLoaded(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.ensureManagedLabelsResolved(ctx, managedLabelsFromDesiredIssues(desired)); err != nil {
-		return err
+		return nil, err
 	}
 
 	op := gqlclient.NewOperation(createIssuesMutation(len(desired)))
 	for i, issue := range desired {
 		stateID, err := c.StateID(issue.State)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		title := issue.Title
@@ -274,19 +289,33 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 		} `json:"issue"`
 	}{}
 	if err := c.execute(ctx, op, &resp); err != nil {
-		return fmt.Errorf("create Linear issues: %w", err)
+		return nil, fmt.Errorf("create Linear issues: %w", err)
 	}
 
-	for alias, result := range resp {
-		if !result.Success {
-			return fmt.Errorf("create Linear issues failed without GraphQL error for %s", alias)
+	var failed []int
+	for i := range desired {
+		alias := fmt.Sprintf("issueCreate%d", i)
+		if result, ok := resp[alias]; !ok || !result.Success {
+			failed = append(failed, i)
 		}
 	}
+	if len(failed) > 0 {
+		c.log.Warn("some Linear issue creates failed without a GraphQL error",
+			slog.Int("failed_count", len(failed)),
+			slog.Int("batch_size", len(desired)),
+		)
+	}
+	// The issues themselves are already created at this point, so a failure to
+	// unsubscribe the actor must not be reported as a create failure — doing so
+	// would send the caller into a retry that duplicates every issue in the
+	// batch.
 	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
-		return err
+		c.log.Warn("failed to unsubscribe actor from newly created Linear issues; the issues themselves were created",
+			slog.Any("error", err),
+		)
 	}
 
-	return nil
+	return failed, nil
 }
 
 func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error {
@@ -353,23 +382,28 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 // explaining which managed fields were modified and why. Comments are posted
 // after a successful update/resolve/cancel mutation so the Linear history
 // shows exactly what the sync changed.
-func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) error {
+// PostComments posts change comments for a batch of updates in one GraphQL
+// mutation. Like CreateIssues it returns the indices (into updates) whose
+// comment failed, so a partial failure does not make the caller re-post the
+// comments that already landed.
+func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error) {
 	if len(updates) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	type commentJob struct {
-		issueID string
-		comment string
+		issueID     string
+		comment     string
+		updateIndex int
 	}
 	var jobs []commentJob
-	for _, update := range updates {
+	for i, update := range updates {
 		if comment := buildChangeComment(update); comment != "" {
-			jobs = append(jobs, commentJob{issueID: update.Existing.ID, comment: comment})
+			jobs = append(jobs, commentJob{issueID: update.Existing.ID, comment: comment, updateIndex: i})
 		}
 	}
 	if len(jobs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	op := gqlclient.NewOperation(commentCreateMutation(len(jobs)))
@@ -389,16 +423,24 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 		} `json:"comment"`
 	}{}
 	if err := c.execute(ctx, op, &resp); err != nil {
-		return fmt.Errorf("post Linear change comments: %w", err)
+		return nil, fmt.Errorf("post Linear change comments: %w", err)
 	}
 
-	for alias, result := range resp {
-		if !result.Success {
-			return fmt.Errorf("post Linear change comment failed without GraphQL error for %s", alias)
+	var failed []int
+	for j, job := range jobs {
+		alias := fmt.Sprintf("commentCreate%d", j)
+		if result, ok := resp[alias]; !ok || !result.Success {
+			failed = append(failed, job.updateIndex)
 		}
 	}
+	if len(failed) > 0 {
+		c.log.Warn("some Linear change comments failed without a GraphQL error",
+			slog.Int("failed_count", len(failed)),
+			slog.Int("batch_size", len(jobs)),
+		)
+	}
 
-	return nil
+	return failed, nil
 }
 
 func (c *Client) loadStates(ctx context.Context) error {
@@ -466,19 +508,66 @@ query teamStates($id: String!, $after: String) {
 }
 
 func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) {
+	// Linear auto-archives closed issues after the team's configured inactivity
+	// period, and archived issues are excluded from the default issues query.
+	// Snyk DAST keeps fixed/accepted/invalid findings in its API indefinitely,
+	// so without includeArchived the sync would stop seeing its own closed
+	// tickets and mint a fresh duplicate for every one of them, every run.
+	//
+	// Archived issues are bounded to those auto-archived within
+	// LINEAR_ARCHIVE_LOOKBACK_DAYS so the snapshot stays a manageable size.
+	lookbackDays := c.cfg.ArchiveLookbackDays
+	if lookbackDays <= 0 {
+		lookbackDays = 35 // defensive; config.Validate() enforces > 0
+	}
+	archiveCutoffTime := time.Now().UTC().Add(-time.Duration(lookbackDays) * 24 * time.Hour)
+	archiveCutoff := linearapi.DateTime(archiveCutoffTime.Format(time.RFC3339))
+	c.log.Info("Linear issue snapshot archive lookback window",
+		slog.Int("lookback_days", lookbackDays),
+		slog.Time("archive_cutoff", archiveCutoffTime),
+	)
+	// Per Linear's NullableDateComparator, Null: true matches records where the
+	// field IS NULL, i.e. issues that have NOT been auto-archived.
+	archivedAtIsNull := true
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
 		},
 		Or: []linearapi.IssueFilter{
 			{
+				// Live issues matching the managed title prefix.
 				Title: &linearapi.StringComparator{
 					StartsWith: new(titlePrefix),
 				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Null: &archivedAtIsNull,
+				},
 			},
 			{
+				// Live issues carrying the managed metadata block.
 				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Null: &archivedAtIsNull,
+				},
+			},
+			{
+				// Recently auto-archived issues matching the title prefix.
+				Title: &linearapi.StringComparator{
+					StartsWith: new(titlePrefix),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Gte: &archiveCutoff,
+				},
+			},
+			{
+				// Recently auto-archived issues carrying the metadata block.
+				Description: &linearapi.NullableStringComparator{
+					Contains: new(metadataHeader),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Gte: &archiveCutoff,
 				},
 			},
 		},
@@ -490,7 +579,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	for {
 		op := gqlclient.NewOperation(`
 query existingIssues($filter: IssueFilter!, $after: String) {
-  issues(first: 100, after: $after, filter: $filter) {
+  issues(first: 100, after: $after, filter: $filter, includeArchived: true) {
     nodes {
       id
       identifier
@@ -499,6 +588,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       url
       priority
       dueDate
+      archivedAt
       state {
         id
         name

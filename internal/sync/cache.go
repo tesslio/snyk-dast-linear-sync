@@ -9,7 +9,11 @@ import (
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-06-26-snyk-dast-sync-cache-v1"
+// metadataSchemaVersion invalidates cached hashes whenever the sync's managed
+// behaviour changes. Bumped for: archived-issue awareness in the Linear
+// snapshot, and lapsed time-limited acceptances now reopening instead of
+// cancelling (both change the desired state/due date for existing findings).
+const metadataSchemaVersion = "2026-08-19-snyk-dast-sync-cache-v2"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
@@ -20,10 +24,10 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 	if desired.PreserveState {
 		statePart += ":preserve"
 	}
-	// Use DueDateBase (raw SLA date) instead of DueDate (floored) for cache
-	// stability. The floor-to-today adjustment changes daily, which would
-	// cause the source hash to churn for overdue issues even when the
-	// underlying finding data has not changed.
+	// Hash DueDateBase (the raw SLA date) rather than DueDate so that any
+	// presentation-level adjustment to the written due date cannot churn the
+	// source hash while the underlying finding data is unchanged. The two
+	// currently match, since past SLA dates are written through as-is.
 	dueDateForHash := desired.DueDateBase
 	if dueDateForHash == "" {
 		dueDateForHash = desired.DueDate
@@ -50,48 +54,6 @@ func existingIssueHash(existing model.ExistingIssue) string {
 		strings.Join(presentManagedLabelNames(existing.Labels, existing.ManagedLabels), ","),
 		fmt.Sprintf("%d", existing.Priority),
 	)
-}
-
-func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existingByFingerprint map[string]model.ExistingIssue, conflicted map[string]struct{}) map[string]string {
-	out := make(map[string]string, len(existingByFingerprint)+len(desiredByFingerprint))
-
-	for fingerprint, desired := range desiredByFingerprint {
-		if _, blocked := conflicted[fingerprint]; blocked {
-			continue
-		}
-		existing, ok := existingByFingerprint[fingerprint]
-		if ok && !needsUpdate(existing, desired) {
-			out[fingerprint] = existingIssueHash(existing)
-			continue
-		}
-		out[fingerprint] = desiredIssueHash(desired)
-	}
-
-	for fingerprint, existing := range existingByFingerprint {
-		if _, blocked := conflicted[fingerprint]; blocked {
-			continue
-		}
-		if _, ok := desiredByFingerprint[fingerprint]; ok {
-			continue
-		}
-
-		resolved := model.DesiredIssue{
-			Fingerprint:   existing.Fingerprint,
-			Title:         existing.Title,
-			Description:   existing.Description,
-			DueDate:       existing.DueDate,
-			State:         model.StateDone,
-			ManagedLabels: existing.ManagedLabels,
-			Priority:      existing.Priority,
-		}
-		if needsUpdate(existing, resolved) {
-			out[fingerprint] = desiredIssueHash(resolved)
-			continue
-		}
-		out[fingerprint] = existingIssueHash(existing)
-	}
-
-	return out
 }
 
 func digestParts(parts ...string) string {

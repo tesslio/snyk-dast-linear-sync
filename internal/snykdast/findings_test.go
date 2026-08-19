@@ -31,7 +31,7 @@ func TestMapStatus(t *testing.T) {
 		{"fixed", "fixed", nil, model.FindingFixed, false},
 		{"invalid is ignored", "invalid", nil, model.FindingIgnored, false},
 		{"accepted without expiry is ignored", "accepted", nil, model.FindingIgnored, false},
-		{"accepted with past expiry is ignored", "accepted", &past, model.FindingIgnored, false},
+		{"accepted with lapsed expiry reopens", "accepted", &past, model.FindingOpen, true},
 		{"accepted with future expiry is snoozed", "accepted", &future, model.FindingSnoozed, true},
 		{"unknown state defaults to open", "unknown", nil, model.FindingOpen, false},
 		{"empty state defaults to open", "", nil, model.FindingOpen, false},

@@ -110,7 +110,7 @@ type targetSummary struct {
 // distinguishes passive checks (response analysis, e.g. missing security
 // headers) from active checks (exploit payloads, e.g. SQL injection, XSS).
 // This field is not documented in the published OpenAPI spec (see
-// docs/openapi-vs-real-api.md) but is present in live API responses.
+// the published OpenAPI schema) but is present in live API responses.
 type definitionNode struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
@@ -422,7 +422,7 @@ type paginatedCorrelations struct {
 // enrichCorrelations fetches Snyk Code (SAST) correlation markdown for
 // findings that have them and attaches the rendered blocks to each Finding.
 // It uses the undocumented `has_sast_correlations` boolean on each finding
-// (see docs/openapi-vs-real-api.md) to identify the subset that needs a
+// (the published schema omits it) to identify the subset that needs a
 // correlation fetch, avoiding a separate /findings/?snyk_sast=true call.
 // Findings with no Snyk Code correlation incur zero extra HTTP calls.
 func (c *Client) enrichCorrelations(ctx context.Context, findings []model.Finding, correlated []bool) error {
@@ -522,15 +522,45 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 		return model.FindingIgnored, time.Time{}
 	case "accepted":
 		if expirationDate != nil {
-			expires, err := time.Parse(time.DateOnly, strings.TrimSpace(*expirationDate))
-			if err == nil && !expires.IsZero() && time.Now().Before(expires) {
-				return model.FindingSnoozed, expires
+			expires, ok := parseExpirationDate(*expirationDate)
+			if ok {
+				if time.Now().Before(expires) {
+					// Acceptance still in force: track the finding but do not
+					// treat it as needing attention yet.
+					return model.FindingSnoozed, expires
+				}
+				// The acceptance was time-limited and has lapsed. A lapsed
+				// acceptance is not a permanent one: the finding needs
+				// attention again, so it reopens with the SLA measured from the
+				// expiry date (see issueDueDate). Mapping it to ignored instead
+				// would silently cancel the ticket at the exact moment the team
+				// asked to be reminded about it.
+				return model.FindingOpen, expires
 			}
 		}
+		// An acceptance with no expiry (or an unparseable one) is permanent.
 		return model.FindingIgnored, time.Time{}
 	default: // notfixed, retesting, or unknown
 		return model.FindingOpen, time.Time{}
 	}
+}
+
+// parseExpirationDate parses a Snyk DAST acceptance expiry. The API documents a
+// plain date, but a full RFC3339 timestamp is accepted too so that a format
+// change upstream does not silently turn every time-limited acceptance into a
+// permanent one. A date-only value is interpreted as midnight UTC, so an
+// acceptance expires at the start of its expiry day.
+func parseExpirationDate(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.DateOnly, time.RFC3339} {
+		if parsed, err := time.Parse(layout, raw); err == nil && !parsed.IsZero() {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func mapSeverity(code int) string {

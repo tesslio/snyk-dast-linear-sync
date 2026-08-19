@@ -263,7 +263,8 @@ Snyk DAST (Probely) finding states map to Linear workflow states:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` -> `Todo` (SLA from acceptance expiry)
-- `accepted` without/past `expiration_date` -> `Cancelled`
+- `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; SLA from acceptance expiry, so the issue is due immediately)
+- `accepted` without an `expiration_date` -> `Cancelled`
 - `invalid` -> `Cancelled`
 - `fixed` -> `Done`
 - missing finding in an existing Snyk DAST target -> `Done`
@@ -274,7 +275,8 @@ The configured Linear state names are resolved by name first, then by workflow t
 These distinctions are intentional:
 
 - A time-limited `accepted` finding is kept open in `Todo` because it requires attention once the acceptance expires. Its due date is calculated from the acceptance expiry so the SLA extends to the normal severity offset from when the acceptance ends.
-- A permanently `accepted` or `invalid` finding is cancelled: it is no longer actionable.
+- Once that acceptance has lapsed, the finding stays in `Todo` rather than being cancelled. A time-limited acceptance is a request to be reminded, so treating an expired one as a permanent acceptance would silently close the ticket at exactly the moment it needs attention.
+- A permanently `accepted` (no expiry) or `invalid` finding is cancelled: it is no longer actionable.
 - If a Snyk DAST finding disappears but the target still exists, the tool treats that as the finding being resolved and moves the Linear ticket to `Done`.
 - If the Snyk DAST target itself is gone, the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
@@ -283,6 +285,26 @@ These distinctions are intentional:
 If a user manually moves a managed issue to any non-terminal Linear state that differs from what the sync would set (e.g. `Todo` or `In Progress` when the configured open state is `Triage`), subsequent syncs will preserve the user's chosen state. This prevents the automation from dragging issues back to the configured state after intentional triage decisions.
 
 Terminal states (`Done`, `Cancelled`) are never preserved — the sync always transitions to a terminal state when the Snyk DAST finding is fixed or permanently accepted/invalidated.
+
+### Archived Linear Issues
+
+Linear auto-archives closed issues after the team's configured inactivity
+period, and archived issues are excluded from Linear's default issue query.
+Snyk DAST keeps `fixed`, `accepted`, and `invalid` findings in its API
+indefinitely, so if the sync could not see its own archived tickets it would
+consider them missing and create a fresh duplicate for every closed finding on
+every run.
+
+The issue snapshot therefore requests archived issues explicitly, bounded to
+those auto-archived within `LINEAR_ARCHIVE_LOOKBACK_DAYS` (default 35) to keep
+the snapshot size manageable. Archived issues cannot be mutated through the
+API, so the sync never tries to update, resolve, or cancel them. If a finding
+whose ticket has been archived becomes active again, the archived ticket cannot
+be reopened, so a replacement ticket is created instead.
+
+Tickets archived longer ago than the lookback window fall outside the snapshot.
+Widen `LINEAR_ARCHIVE_LOOKBACK_DAYS` if your team's auto-archive period is
+longer than the default.
 
 ### Due Dates
 
@@ -347,6 +369,7 @@ Optional:
 - `LINEAR_TARGET_TYPE_LABEL_DEFAULT`
 - `LINEAR_UNSUBSCRIBE_ACTOR`
 - `LINEAR_COMMENTS`
+- `LINEAR_ARCHIVE_LOOKBACK_DAYS`
 - `LINEAR_DUE_DAYS_CRITICAL`
 - `LINEAR_DUE_DAYS_HIGH`
 - `LINEAR_DUE_DAYS_MEDIUM`

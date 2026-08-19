@@ -168,7 +168,8 @@ Snyk DAST (Probely) finding states map to Linear workflow states as follows:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
-- `accepted` without (or past) `expiration_date` (permanent risk acceptance) -> `Cancelled`
+- `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (SLA measured from the acceptance expiry, so the issue is already due)
+- `accepted` without an `expiration_date` (permanent risk acceptance) -> `Cancelled`
 - `invalid` (false positive) -> `Cancelled`
 - `fixed` -> `Done`
 - missing finding in an existing Snyk DAST target -> `Done`
@@ -181,6 +182,20 @@ A time-limited `accepted` finding is kept open in `Todo` rather than cancelled,
 because it requires attention once the acceptance expires. Its due date is
 calculated from the acceptance expiry date so the SLA extends to the normal
 severity offset from when the acceptance ends.
+
+A lapsed time-limited acceptance stays in `Todo` for the same reason: the
+acceptance was a request to be reminded at the expiry date, so mapping the
+expired state onto a permanent acceptance would cancel the ticket at exactly
+the moment it becomes actionable again. Only an acceptance with no expiry at
+all is treated as permanent.
+
+Archived Linear issues are a special case. Linear auto-archives closed issues
+and excludes them from the default issue query, while Snyk DAST retains
+terminal findings indefinitely, so the sync must ask for archived issues
+explicitly (bounded by `LINEAR_ARCHIVE_LOOKBACK_DAYS`) or it would recreate a
+duplicate for every closed finding on every run. Archived issues cannot be
+mutated, so they are never updated, resolved, or cancelled; a finding that
+becomes active again gets a replacement ticket instead of a reopened one.
 
 ### Manual Non-Terminal State Override
 

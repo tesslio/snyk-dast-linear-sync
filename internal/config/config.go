@@ -28,6 +28,14 @@ const (
 	defaultLinearConcurrency    = 8
 	defaultErrorLogFile         = "logs/snyk-dast-linear-sync-errors.log"
 	defaultCacheDBFile          = "data/snyk-dast-linear-sync-cache.db"
+
+	// defaultArchiveLookbackDays is the lookback window for including
+	// auto-archived Linear issues in the snapshot. Linear excludes archived
+	// issues from the default issues query, so a closed managed ticket that
+	// Linear has since auto-archived would otherwise look absent and be
+	// recreated on every run. 35 days (5 weeks) covers the common
+	// auto-archive period with margin while keeping the snapshot bounded.
+	defaultArchiveLookbackDays = 35
 )
 
 type Config struct {
@@ -65,9 +73,12 @@ type LinearConfig struct {
 	TeamID           string
 	UnsubscribeActor bool
 	CommentsEnabled  bool
-	States           StateConfig
-	Labels           LabelConfig
-	Due              DueDateConfig
+	// ArchiveLookbackDays bounds how far back auto-archived Linear issues are
+	// pulled into the snapshot. See defaultArchiveLookbackDays.
+	ArchiveLookbackDays int
+	States              StateConfig
+	Labels              LabelConfig
+	Due                 DueDateConfig
 }
 
 type StateConfig struct {
@@ -147,6 +158,8 @@ func Load(args []string) (Config, error) {
 			TeamID:           os.Getenv("LINEAR_TEAM_ID"),
 			UnsubscribeActor: getEnvBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
 			CommentsEnabled:  getEnvBool("LINEAR_COMMENTS", false),
+
+			ArchiveLookbackDays: getEnvInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
 			States: StateConfig{
 				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
@@ -198,6 +211,9 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.TeamID == "" {
 		errs = append(errs, errors.New("LINEAR_TEAM_ID is required"))
+	}
+	if c.Linear.ArchiveLookbackDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
 	}
 	if strings.TrimSpace(c.Log.ErrorFile) == "" {
 		errs = append(errs, errors.New("ERROR_LOG_FILE must not be empty"))

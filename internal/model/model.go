@@ -109,14 +109,20 @@ type ExistingIssue struct {
 	ManagedLabels []string
 	Labels        []IssueLabel
 	Priority      int
+	// ArchivedAt is non-nil when Linear has auto-archived the issue. Archived
+	// issues are excluded from Linear's default issues query, so the sync asks
+	// for them explicitly (includeArchived: true, bounded by
+	// LINEAR_ARCHIVE_LOOKBACK_DAYS) to avoid recreating tickets that already
+	// exist. They are always terminal and cannot be mutated via the API.
+	ArchivedAt *time.Time
 }
 
 type DesiredIssue struct {
 	Fingerprint   string
 	Title         string
 	Description   string
-	DueDate       string // effective due date written to Linear (floored to today if the raw SLA date is past)
-	DueDateBase   string // raw SLA date from Snyk DAST data (CreatedAt or IgnoreExpiresAt + offset); used for cache hashing so that the floor-to-today adjustment does not cause daily cache churn
+	DueDate       string // effective due date written to Linear
+	DueDateBase   string // raw SLA date from Snyk DAST data (CreatedAt or IgnoreExpiresAt + offset); used for cache hashing. Past SLA dates are written through as-is rather than floored to today, so this currently matches DueDate.
 	State         IssueState
 	ManagedLabels []string
 	Priority      int
