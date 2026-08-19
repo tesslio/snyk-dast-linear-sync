@@ -31,7 +31,7 @@ func TestMapStatus(t *testing.T) {
 		{"fixed", "fixed", nil, model.FindingFixed, false},
 		{"invalid is ignored", "invalid", nil, model.FindingIgnored, false},
 		{"accepted without expiry is ignored", "accepted", nil, model.FindingIgnored, false},
-		{"accepted with past expiry is ignored", "accepted", &past, model.FindingIgnored, false},
+		{"accepted with lapsed expiry reopens", "accepted", &past, model.FindingOpen, true},
 		{"accepted with future expiry is snoozed", "accepted", &future, model.FindingSnoozed, true},
 		{"unknown state defaults to open", "unknown", nil, model.FindingOpen, false},
 		{"empty state defaults to open", "", nil, model.FindingOpen, false},
@@ -136,5 +136,58 @@ func TestNumericFindingID(t *testing.T) {
 		if got := numericFindingID(tc.composite); got != tc.want {
 			t.Errorf("numericFindingID(%q) = %q, want %q", tc.composite, got, tc.want)
 		}
+	}
+}
+
+// TestMapStatusDateOnlyExpiryCoversItsFinalDay pins the acceptance boundary. A
+// Snyk DAST expiration_date of "2026-08-19" means the acceptance covers all of
+// the 19th, so it must not lapse until the end of that day. Comparing against
+// midnight expired it a day early, dragging the finding back into triage while
+// the team still considered it accepted.
+func TestMapStatusDateOnlyExpiryCoversItsFinalDay(t *testing.T) {
+	nowUTC := time.Now().UTC()
+	today := nowUTC.Format(time.DateOnly)
+	yesterday := nowUTC.AddDate(0, 0, -1).Format(time.DateOnly)
+	tomorrow := nowUTC.AddDate(0, 0, 1).Format(time.DateOnly)
+
+	cases := []struct {
+		name string
+		date string
+		want model.FindingStatus
+	}{
+		{"expiry today is still accepted", today, model.FindingSnoozed},
+		{"expiry tomorrow is still accepted", tomorrow, model.FindingSnoozed},
+		{"expiry yesterday has lapsed", yesterday, model.FindingOpen},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, expires := mapStatus("accepted", &tc.date)
+			if got != tc.want {
+				t.Fatalf("mapStatus(accepted, %q) = %q, want %q", tc.date, got, tc.want)
+			}
+			// Either way the expiry is reported as written, so the SLA due date
+			// is measured from the date itself rather than from end-of-day.
+			wantExpires, err := time.Parse(time.DateOnly, tc.date)
+			if err != nil {
+				t.Fatalf("time.Parse() error = %v", err)
+			}
+			if !expires.Equal(wantExpires) {
+				t.Fatalf("expires = %v, want %v (the date as written)", expires, wantExpires)
+			}
+		})
+	}
+}
+
+// TestMapStatusRFC3339ExpiryUsesItsOwnTime confirms a timestamped expiry is
+// compared at its stated instant, with no end-of-day extension.
+func TestMapStatusRFC3339ExpiryUsesItsOwnTime(t *testing.T) {
+	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+
+	if got, _ := mapStatus("accepted", &past); got != model.FindingOpen {
+		t.Fatalf("mapStatus(accepted, one hour ago) = %q, want %q", got, model.FindingOpen)
+	}
+	if got, _ := mapStatus("accepted", &future); got != model.FindingSnoozed {
+		t.Fatalf("mapStatus(accepted, one hour ahead) = %q, want %q", got, model.FindingSnoozed)
 	}
 }

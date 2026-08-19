@@ -2,7 +2,9 @@ package linear
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -563,5 +565,378 @@ func TestBuildChangeCommentReturnsEmptyWhenDiffIsNil(t *testing.T) {
 
 	if comment != "" {
 		t.Fatalf("expected empty comment when diff is nil, got: %s", comment)
+	}
+}
+
+// TestLoadIssuesRequestsArchivedIssues guards the fix for closed managed
+// tickets disappearing from the snapshot. Linear excludes auto-archived issues
+// from the default issues query, and Snyk DAST keeps fixed/accepted findings in
+// its API indefinitely, so without includeArchived the sync stops seeing its own
+// closed tickets and mints a fresh duplicate for each of them on every run.
+//
+// It also pins the AutoArchivedAt.Null boolean. Per Linear's
+// NullableDateComparator, "null: true" matches records where the field IS null
+// (i.e. NOT archived) while "null: false" matches non-null values (archived).
+// Inverting it would make the live-issue clauses match only archived tickets.
+func TestLoadIssuesRequestsArchivedIssues(t *testing.T) {
+	var capturedQuery string
+	var capturedFilter map[string]any
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:              "team-1",
+			ArchiveLookbackDays: 21,
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				if filter, ok := payload.Variables["filter"].(map[string]any); ok {
+					capturedFilter = filter
+				}
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.loadIssues(context.Background()); err != nil {
+		t.Fatalf("loadIssues() error = %v", err)
+	}
+
+	if !strings.Contains(capturedQuery, "includeArchived: true") {
+		t.Fatalf("issues query must pass includeArchived: true, got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, "archivedAt") {
+		t.Fatalf("issues query must select archivedAt, got:\n%s", capturedQuery)
+	}
+
+	clauses, ok := capturedFilter["or"].([]any)
+	if !ok {
+		t.Fatalf("filter must carry an OR clause list, got: %#v", capturedFilter)
+	}
+	if len(clauses) != 4 {
+		t.Fatalf("OR clauses = %d, want 4 (title/description x live/archived)", len(clauses))
+	}
+
+	nullTrue, gte := 0, 0
+	for _, raw := range clauses {
+		clause, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause is not an object: %#v", raw)
+		}
+		archived, ok := clause["autoArchivedAt"].(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause missing autoArchivedAt: %#v", clause)
+		}
+		if val, has := archived["null"]; has {
+			isNull, ok := val.(bool)
+			if !ok || !isNull {
+				t.Fatalf("autoArchivedAt.null = %#v, want true (matches NOT-archived issues)", val)
+			}
+			nullTrue++
+			continue
+		}
+		if val, has := archived["gte"]; has {
+			cutoff, ok := val.(string)
+			if !ok || cutoff == "" {
+				t.Fatalf("autoArchivedAt.gte = %#v, want a non-empty cutoff timestamp", val)
+			}
+			gte++
+			continue
+		}
+		t.Fatalf("autoArchivedAt has neither null nor gte: %#v", archived)
+	}
+	if nullTrue != 2 {
+		t.Fatalf("clauses with autoArchivedAt.null=true = %d, want 2", nullTrue)
+	}
+	if gte != 2 {
+		t.Fatalf("clauses with autoArchivedAt.gte = %d, want 2", gte)
+	}
+}
+
+// TestCreateIssuesReportsOnlyFailedIndices pins the partial-failure contract:
+// a per-alias failure must be reported as an index, not as a batch-wide error,
+// so the caller retries just that entry instead of duplicating the rest.
+func TestCreateIssuesReportsOnlyFailedIndices(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if !strings.Contains(string(body), "mutation issueCreateBatch") {
+					t.Fatalf("unexpected request body: %s", body)
+				}
+				// Entry 1 fails; entries 0 and 2 are created.
+				return jsonResponse(t, `{"data":{
+					"issueCreate0":{"success":true,"issue":{"id":"i0","identifier":"SEC-1"}},
+					"issueCreate1":{"success":false,"issue":{"id":"","identifier":""}},
+					"issueCreate2":{"success":true,"issue":{"id":"i2","identifier":"SEC-3"}}
+				}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{
+		{Fingerprint: "f0", Title: "a", State: model.StateTodo},
+		{Fingerprint: "f1", Title: "b", State: model.StateTodo},
+		{Fingerprint: "f2", Title: "c", State: model.StateTodo},
+	}
+	failed, err := client.CreateIssues(context.Background(), desired)
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil: a per-alias failure must not fail the batch", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
+	}
+}
+
+// TestCreateIssuesKeepsPartialDataOnGraphQLError is the regression test for the
+// duplicate path CodeRabbit caught. gqlclient decodes the response body into the
+// out param BEFORE returning joinErrors(...), so a mutation that errored for one
+// alias still leaves the successful aliases decoded. Reporting a batch error and
+// discarding them makes the caller recreate everything that already succeeded.
+func TestCreateIssuesKeepsPartialDataOnGraphQLError(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Entries 0 and 2 created; entry 1 failed with a GraphQL error.
+				// Linear returns both data and errors in this situation.
+				return jsonResponse(t, `{
+					"data":{
+						"issueCreate0":{"success":true,"issue":{"id":"i0","identifier":"SEC-1"}},
+						"issueCreate2":{"success":true,"issue":{"id":"i2","identifier":"SEC-3"}}
+					},
+					"errors":[{"message":"Entity not found: WorkflowState"}]
+				}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{
+		{Fingerprint: "f0", Title: "a", State: model.StateTodo},
+		{Fingerprint: "f1", Title: "b", State: model.StateTodo},
+		{Fingerprint: "f2", Title: "c", State: model.StateTodo},
+	}
+	failed, err := client.CreateIssues(context.Background(), desired)
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil: partial data must not be discarded, "+
+			"otherwise the caller recreates the two issues that succeeded", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
+	}
+}
+
+// TestCreateIssuesReturnsErrorWhenNoAliasesDecoded confirms the other side: with
+// no per-alias outcome at all, the error must surface so the caller retries
+// everything individually.
+func TestCreateIssuesReturnsErrorWhenNoAliasesDecoded(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: false,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				return jsonResponse(t, `{"errors":[{"message":"Query validation failed"}]}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{"todo": "state-todo"},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	desired := []model.DesiredIssue{{Fingerprint: "f0", Title: "a", State: model.StateTodo}}
+	if _, err := client.CreateIssues(context.Background(), desired); err == nil {
+		t.Fatal("CreateIssues() error = nil, want an error when no alias outcome is known")
+	}
+}
+
+// TestPostCommentsKeepsPartialDataOnGraphQLError mirrors the CreateIssues
+// partial-data test for comments: aliases that posted must not be retried, or
+// the issue ends up with the same change comment twice.
+func TestPostCommentsKeepsPartialDataOnGraphQLError(t *testing.T) {
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Comments 0 and 2 posted; comment 1 errored.
+				return jsonResponse(t, `{
+					"data":{
+						"commentCreate0":{"success":true,"comment":{"id":"c0"}},
+						"commentCreate2":{"success":true,"comment":{"id":"c2"}}
+					},
+					"errors":[{"message":"Entity not found: Issue"}]
+				}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	// Each update needs a diff, or buildChangeComment returns "" and the update
+	// is never given a comment alias.
+	updates := make([]model.IssueUpdate, 0, 3)
+	for i := range 3 {
+		updates = append(updates, model.IssueUpdate{
+			Existing: model.ExistingIssue{ID: fmt.Sprintf("i%d", i), Identifier: fmt.Sprintf("SEC-%d", i), StateName: "Todo"},
+			Desired:  model.DesiredIssue{Fingerprint: fmt.Sprintf("f%d", i), State: model.StateDone},
+			Diff:     &model.IssueDiff{StateChanged: true, StateFrom: "Todo", StateTo: "Done"},
+		})
+	}
+
+	failed, err := client.PostComments(context.Background(), updates)
+	if err != nil {
+		t.Fatalf("PostComments() error = %v, want nil: partial data must not be discarded, "+
+			"otherwise the two posted comments are duplicated on retry", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed indices = %#v, want [1]", failed)
+	}
+}
+
+// TestExistingFingerprintsRejectsNonAdvancingCursor pins the pagination guard. A
+// server that keeps reporting hasNextPage with an unchanged cursor would loop
+// forever, and the run context may carry no deadline to break out of it.
+func TestExistingFingerprintsRejectsNonAdvancingCursor(t *testing.T) {
+	requests := 0
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				if requests > 10 {
+					t.Fatal("ExistingFingerprints kept paginating on an unchanged cursor")
+				}
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				// Always the same cursor, always claiming another page.
+				return jsonResponse(t, `{"data":{"issues":{
+					"nodes":[],
+					"pageInfo":{"hasNextPage":true,"endCursor":"stuck"}
+				}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	_, err := client.ExistingFingerprints(context.Background(), []string{"snyk-dast:t:1"})
+	if err == nil {
+		t.Fatal("ExistingFingerprints() error = nil, want an error when the cursor does not advance")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("error = %v, want it to name the non-advancing cursor", err)
+	}
+}
+
+// TestExistingFingerprintsReportsOnlyLiveMatches confirms the lookup returns the
+// requested fingerprints that exist and ignores anything else Linear returns.
+func TestExistingFingerprintsReportsOnlyLiveMatches(t *testing.T) {
+	var capturedQuery string
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				return jsonResponse(t, `{"data":{"issues":{
+					"nodes":[
+						{"id":"i1","identifier":"SEC-1","description":"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:t:1\n-->"},
+						{"id":"i9","identifier":"SEC-9","description":"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:t:999\n-->"}
+					],
+					"pageInfo":{"hasNextPage":false,"endCursor":null}
+				}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	found, err := client.ExistingFingerprints(context.Background(), []string{"snyk-dast:t:1", "snyk-dast:t:2"})
+	if err != nil {
+		t.Fatalf("ExistingFingerprints() error = %v", err)
+	}
+	if _, ok := found["snyk-dast:t:1"]; !ok {
+		t.Fatalf("found = %#v, want it to contain the live fingerprint", found)
+	}
+	if _, ok := found["snyk-dast:t:2"]; ok {
+		t.Fatal("found contains a fingerprint with no live issue")
+	}
+	if len(found) != 1 {
+		t.Fatalf("found = %#v, want exactly the one requested fingerprint that exists", found)
+	}
+	// Archived issues must not count as evidence a create landed, or the
+	// replacement ticket for a reopened archived finding would be suppressed.
+	if !strings.Contains(capturedQuery, "includeArchived: false") {
+		t.Fatalf("fingerprint lookup must be explicit about excluding archived issues, got:\n%s", capturedQuery)
 	}
 }

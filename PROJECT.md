@@ -168,7 +168,8 @@ Snyk DAST (Probely) finding states map to Linear workflow states as follows:
 
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
-- `accepted` without (or past) `expiration_date` (permanent risk acceptance) -> `Cancelled`
+- `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (due date is the acceptance expiry plus the configured severity offset)
+- `accepted` without an `expiration_date` (permanent risk acceptance) -> `Cancelled`
 - `invalid` (false positive) -> `Cancelled`
 - `fixed` -> `Done`
 - missing finding in an existing Snyk DAST target -> `Done`
@@ -181,6 +182,48 @@ A time-limited `accepted` finding is kept open in `Todo` rather than cancelled,
 because it requires attention once the acceptance expires. Its due date is
 calculated from the acceptance expiry date so the SLA extends to the normal
 severity offset from when the acceptance ends.
+
+A lapsed time-limited acceptance stays in `Todo` for the same reason: the
+acceptance was a request to be reminded at the expiry date, so mapping the
+expired state onto a permanent acceptance would cancel the ticket at exactly
+the moment it becomes actionable again. Only an acceptance with no expiry at
+all is treated as permanent.
+
+Archived Linear issues are a special case. Linear auto-archives closed issues
+and excludes them from the default issue query, while Snyk DAST retains
+terminal findings indefinitely, so the sync must ask for archived issues
+explicitly (bounded by `LINEAR_ARCHIVE_LOOKBACK_DAYS`) or it recreates a
+duplicate each time a ticket leaves the snapshot — once per archive cycle rather
+than on every run, since each replacement is visible until Linear archives it in
+turn. Archived issues are treated as
+terminal and are not mutated in place; a finding that becomes active again gets
+a replacement ticket.
+
+The replacement is a product choice, not an API constraint: Linear's
+`issueUnarchive` mutation carries no documented precondition, so restoring and
+updating the original ticket is a supported alternative. It was considered and
+rejected — each recurrence is intended to get a clean ticket with its own SLA
+clock rather than one ticket reused across recurrences.
+
+The lookback window bounds elapsed time since **auto-**archiving, not the team's
+auto-archive period (which Linear expresses in months). The two are
+independent, so a short window is not made safe by a short period. It also does
+not bound every archived issue: manually or API-archived issues (trashed ones
+included) have `archivedAt` set with `autoArchivedAt` null, so they are returned
+regardless of age. Including them can only prevent duplicates, and the pinned
+`linear-api` binding has no `IssueFilter.archivedAt` to bound them with.
+
+Since Snyk DAST retains terminal findings indefinitely, each keeps a live
+desired issue forever, and any finite window eventually drops its ticket from
+the snapshot — minting a duplicate that cannot be reconciled, because the
+original is no longer visible to the duplicate-cancellation pass. The copies
+therefore accumulate, one per cycle. `LINEAR_ARCHIVE_LOOKBACK_DAYS` defaults to
+ten years for that reason: it covers the whole archive in practice, and remains
+configurable only as a size/latency escape hatch.
+
+Suppressing creates for already-terminal findings would also remove the cycle,
+but was rejected: the project wants every finding to end up with a ticket,
+including findings closed before the sync first ran.
 
 ### Manual Non-Terminal State Override
 
@@ -234,6 +277,38 @@ It uses:
 
 The cache is critical for steady-state performance. A healthy steady-state run
 should do little or no work when nothing has changed.
+
+### Batch Failure Handling
+
+Linear mutations are batched, one GraphQL alias per entry, so a batch can fail
+three different ways and each needs different handling to avoid duplicating
+tickets:
+
+- **Per-alias failure.** The response carries `success: false`, or omits the
+  alias, while the other aliases succeeded. Note that `gqlclient` decodes the
+  response body before returning any GraphQL error, so the successful aliases are
+  still available even when an error is returned. Only the reported entries are
+  retried; retrying the batch would duplicate the ones that already exist.
+- **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
+  entry. This covers a transport-level failure and equally a GraphQL failure that
+  returned no data, such as a rejected query. Crucially it does *not* prove Linear
+  rejected the mutation, which may have been committed before the response was
+  lost. Creates are therefore reconciled first: `ExistingFingerprints` asks Linear
+  which of the batch's fingerprints now have a live issue, and only the rest are
+  re-created. If that lookup also fails, nothing is retried and the entries are
+  counted as failed. The finding remains in the next Snyk DAST snapshot either
+  way; if its issue was never created it is absent from the next Linear snapshot
+  and gets created on the next run. Missing a ticket for one cycle is recoverable;
+  a duplicate is only undone later by the duplicate-cancellation pass.
+- **Ambiguous comment failure.** A comment carries no fingerprint to reconcile
+  against, and a duplicated change comment is more disruptive than a missing one
+  (the issue state itself is already correct), so these are counted in
+  `FailedComments` and not retried.
+
+A residual race remains by construction: Linear's `issueCreate` exposes no
+idempotency key, so a write that lands between the reconciliation query and the
+retry still duplicates. The duplicate-cancellation pass converges that case on a
+later run.
 
 ## SQLite Cache
 

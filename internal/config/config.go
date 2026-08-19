@@ -28,7 +28,39 @@ const (
 	defaultLinearConcurrency    = 8
 	defaultErrorLogFile         = "logs/snyk-dast-linear-sync-errors.log"
 	defaultCacheDBFile          = "data/snyk-dast-linear-sync-cache.db"
+
+	// defaultArchiveLookbackDays bounds how long ago an issue may have been
+	// auto-archived and still be pulled into the snapshot. Linear excludes
+	// archived issues from the default issues query, so a closed managed ticket
+	// that Linear has since auto-archived would otherwise look absent and be
+	// recreated.
+	//
+	// Note what this window is and is not: it bounds the time elapsed SINCE
+	// archiving, not the length of the team's auto-archive period (which Linear
+	// expresses in months, via Team.autoArchivePeriod). The two are independent,
+	// and a short window is not made safe by a short period.
+	//
+	// Because Snyk DAST retains fixed/accepted/invalid findings indefinitely,
+	// every one of them keeps a live desired issue forever, so ANY finite window
+	// eventually loses the ticket and mints a duplicate — and since the original
+	// is no longer visible, duplicate cancellation cannot pair them up and the
+	// copies accumulate. Correctness therefore wants the window to cover the
+	// entire archived backlog, which is why the default is effectively
+	// unbounded. It stays configurable purely as a size/latency escape hatch:
+	// lowering it trades duplicate-freedom for a smaller snapshot on each run.
+	defaultArchiveLookbackDays = DefaultArchiveLookbackDays
+
+	// maxArchiveLookbackDays is the largest value that survives conversion to a
+	// 24-hour time.Duration. math.MaxInt64 nanoseconds is ~106751.99 days, so a
+	// larger value overflows and yields a nonsense (possibly future) archive
+	// cutoff, which would silently exclude every archived issue and bring the
+	// duplicate-creation bug straight back.
+	maxArchiveLookbackDays = 106751
 )
+
+// DefaultArchiveLookbackDays is the default archive lookback window, exported so
+// the Linear client's defensive fallback cannot drift from the config default.
+const DefaultArchiveLookbackDays = 3650
 
 type Config struct {
 	DryRun  bool
@@ -65,9 +97,12 @@ type LinearConfig struct {
 	TeamID           string
 	UnsubscribeActor bool
 	CommentsEnabled  bool
-	States           StateConfig
-	Labels           LabelConfig
-	Due              DueDateConfig
+	// ArchiveLookbackDays bounds how far back auto-archived Linear issues are
+	// pulled into the snapshot. See defaultArchiveLookbackDays.
+	ArchiveLookbackDays int
+	States              StateConfig
+	Labels              LabelConfig
+	Due                 DueDateConfig
 }
 
 type StateConfig struct {
@@ -147,6 +182,8 @@ func Load(args []string) (Config, error) {
 			TeamID:           os.Getenv("LINEAR_TEAM_ID"),
 			UnsubscribeActor: getEnvBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
 			CommentsEnabled:  getEnvBool("LINEAR_COMMENTS", false),
+
+			ArchiveLookbackDays: getEnvInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
 			States: StateConfig{
 				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
@@ -198,6 +235,11 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.TeamID == "" {
 		errs = append(errs, errors.New("LINEAR_TEAM_ID is required"))
+	}
+	if c.Linear.ArchiveLookbackDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
+	} else if c.Linear.ArchiveLookbackDays > maxArchiveLookbackDays {
+		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be <= %d (a larger value overflows time.Duration), got %d", maxArchiveLookbackDays, c.Linear.ArchiveLookbackDays))
 	}
 	if strings.TrimSpace(c.Log.ErrorFile) == "" {
 		errs = append(errs, errors.New("ERROR_LOG_FILE must not be empty"))
