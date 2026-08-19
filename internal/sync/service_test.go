@@ -2088,6 +2088,12 @@ func TestRunCountsAmbiguousCommentBatchWithoutRetrying(t *testing.T) {
 	if result.PlannedUpdates != 1 {
 		t.Fatalf("PlannedUpdates = %d, want 1 (the update itself must still apply)", result.PlannedUpdates)
 	}
+	// PlannedUpdates only proves the update was queued. Assert it actually
+	// applied, so a regression that suppresses the update while keeping the
+	// planned count is caught here too.
+	if len(linear.updated) != 1 {
+		t.Fatalf("applied updates = %d, want 1: the comment failure must not prevent the issue update", len(linear.updated))
+	}
 	// The batch is counted, not silently dropped.
 	if result.FailedComments != 1 {
 		t.Fatalf("FailedComments = %d, want 1 (the size of the ambiguous batch)", result.FailedComments)
