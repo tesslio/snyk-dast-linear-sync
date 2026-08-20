@@ -625,23 +625,16 @@ func TestLoadIssuesRequestsArchivedIssues(t *testing.T) {
 		t.Fatalf("issues query must select archivedAt, got:\n%s", capturedQuery)
 	}
 
-	clauses, ok := capturedFilter["or"].([]any)
-	if !ok {
-		t.Fatalf("filter must carry an OR clause list, got: %#v", capturedFilter)
-	}
-	if len(clauses) != 4 {
-		t.Fatalf("OR clauses = %d, want 4 (title/description x live/archived)", len(clauses))
-	}
-
+	archiveArm := archiveWindowArm(t, capturedFilter)
 	nullTrue, gte := 0, 0
-	for _, raw := range clauses {
+	for _, raw := range archiveArm {
 		clause, ok := raw.(map[string]any)
 		if !ok {
-			t.Fatalf("OR clause is not an object: %#v", raw)
+			t.Fatalf("archive OR clause is not an object: %#v", raw)
 		}
 		archived, ok := clause["autoArchivedAt"].(map[string]any)
 		if !ok {
-			t.Fatalf("OR clause missing autoArchivedAt: %#v", clause)
+			t.Fatalf("archive OR clause missing autoArchivedAt: %#v", clause)
 		}
 		if val, has := archived["null"]; has {
 			isNull, ok := val.(bool)
@@ -661,11 +654,208 @@ func TestLoadIssuesRequestsArchivedIssues(t *testing.T) {
 		}
 		t.Fatalf("autoArchivedAt has neither null nor gte: %#v", archived)
 	}
-	if nullTrue != 2 {
-		t.Fatalf("clauses with autoArchivedAt.null=true = %d, want 2", nullTrue)
+	if nullTrue != 1 {
+		t.Fatalf("clauses with autoArchivedAt.null=true = %d, want 1", nullTrue)
 	}
-	if gte != 2 {
-		t.Fatalf("clauses with autoArchivedAt.gte = %d, want 2", gte)
+	if gte != 1 {
+		t.Fatalf("clauses with autoArchivedAt.gte = %d, want 1", gte)
+	}
+}
+
+// andArms returns the filter's top-level AND arms. The filter is deliberately
+// shaped as team AND (archive window) AND (identity) so that neither group can be
+// read as a sibling of the other -- mixing an `or` with sibling fields leaves the
+// grouping to Linear's interpretation, and this query is too expensive to get
+// wrong.
+func andArms(t *testing.T, filter map[string]any) []any {
+	t.Helper()
+	arms, ok := filter["and"].([]any)
+	if !ok {
+		t.Fatalf("filter must carry an AND arm list, got: %#v", filter)
+	}
+	if len(arms) != 2 {
+		t.Fatalf("AND arms = %d, want 2 (archive window, identity)", len(arms))
+	}
+	return arms
+}
+
+// armOr extracts the OR clause list from one AND arm.
+func armOr(t *testing.T, arm any) []any {
+	t.Helper()
+	obj, ok := arm.(map[string]any)
+	if !ok {
+		t.Fatalf("AND arm is not an object: %#v", arm)
+	}
+	clauses, ok := obj["or"].([]any)
+	if !ok {
+		t.Fatalf("AND arm must carry an OR clause list, got: %#v", obj)
+	}
+	return clauses
+}
+
+// archiveWindowArm returns the OR clauses of whichever AND arm constrains
+// autoArchivedAt, so the tests do not depend on arm ordering.
+func archiveWindowArm(t *testing.T, filter map[string]any) []any {
+	t.Helper()
+	for _, arm := range andArms(t, filter) {
+		clauses := armOr(t, arm)
+		if len(clauses) == 0 {
+			continue
+		}
+		if first, ok := clauses[0].(map[string]any); ok {
+			if _, isArchive := first["autoArchivedAt"]; isArchive {
+				return clauses
+			}
+		}
+	}
+	t.Fatalf("no AND arm constrains autoArchivedAt: %#v", filter)
+	return nil
+}
+
+// identityArm returns the OR clauses of whichever AND arm selects this sync's own
+// tickets.
+func identityArm(t *testing.T, filter map[string]any) []any {
+	t.Helper()
+	for _, arm := range andArms(t, filter) {
+		clauses := armOr(t, arm)
+		if len(clauses) == 0 {
+			continue
+		}
+		if first, ok := clauses[0].(map[string]any); ok {
+			if _, isArchive := first["autoArchivedAt"]; !isArchive {
+				return clauses
+			}
+		}
+	}
+	t.Fatalf("no AND arm selects managed issues: %#v", filter)
+	return nil
+}
+
+// loadIssuesFilter runs loadIssues against a stub that captures the filter
+// variable, so a test can assert the query's shape.
+func loadIssuesFilter(t *testing.T, managedLabel string) map[string]any {
+	t.Helper()
+	var captured map[string]any
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:              "team-1",
+			ArchiveLookbackDays: 21,
+			Labels:              config.LabelConfig{Managed: managedLabel},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if filter, ok := payload.Variables["filter"].(map[string]any); ok {
+					captured = filter
+				}
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.loadIssues(context.Background()); err != nil {
+		t.Fatalf("loadIssues() error = %v", err)
+	}
+	if captured == nil {
+		t.Fatal("loadIssues() did not send a filter variable")
+	}
+	return captured
+}
+
+// TestLoadIssuesScopesSnapshotToManagedLabel is the regression guard for the
+// snapshot blowing up on a shared Linear team. A run against a team holding
+// another sync's tickets loaded 59,866 issues for 7 findings, because the
+// identity arm filtered on `description: { contains: <metadata header> }` and
+// that predicate did not bound the result set. The identity arm must instead use
+// exact predicates: the managed title prefix and the managed label name.
+func TestLoadIssuesScopesSnapshotToManagedLabel(t *testing.T) {
+	filter := loadIssuesFilter(t, "snyk-dast-automation")
+
+	raw, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(raw), "description") {
+		t.Fatalf("filter must not constrain description; it does not bound the result set: %s", raw)
+	}
+
+	clauses := identityArm(t, filter)
+	if len(clauses) != 2 {
+		t.Fatalf("identity clauses = %d, want 2 (title prefix, managed label)", len(clauses))
+	}
+
+	var sawTitle, sawLabel bool
+	for _, rawClause := range clauses {
+		clause, ok := rawClause.(map[string]any)
+		if !ok {
+			t.Fatalf("identity clause is not an object: %#v", rawClause)
+		}
+		if title, ok := clause["title"].(map[string]any); ok {
+			if got := title["startsWith"]; got != titlePrefix {
+				t.Fatalf("title.startsWith = %#v, want %q", got, titlePrefix)
+			}
+			sawTitle = true
+			continue
+		}
+		if labels, ok := clause["labels"].(map[string]any); ok {
+			some, ok := labels["some"].(map[string]any)
+			if !ok {
+				t.Fatalf("labels filter must use `some`, got: %#v", labels)
+			}
+			name, ok := some["name"].(map[string]any)
+			if !ok {
+				t.Fatalf("labels.some must constrain name, got: %#v", some)
+			}
+			if got := name["eqIgnoreCase"]; got != "snyk-dast-automation" {
+				t.Fatalf("labels.some.name.eqIgnoreCase = %#v, want the managed label", got)
+			}
+			sawLabel = true
+			continue
+		}
+		t.Fatalf("identity clause is neither a title nor a labels predicate: %#v", clause)
+	}
+	if !sawTitle {
+		t.Fatal("identity arm lost the title-prefix clause; a retitled ticket is the only thing the label clause misses")
+	}
+	if !sawLabel {
+		t.Fatal("identity arm is missing the managed-label clause")
+	}
+}
+
+// TestLoadIssuesOmitsLabelClauseWhenLabelManagementDisabled keeps
+// LINEAR_MANAGED_LABEL=off working. An arm matching a label that is never applied
+// would narrow the snapshot, hiding managed tickets and minting duplicates.
+func TestLoadIssuesOmitsLabelClauseWhenLabelManagementDisabled(t *testing.T) {
+	filter := loadIssuesFilter(t, "")
+
+	clauses := identityArm(t, filter)
+	if len(clauses) != 1 {
+		t.Fatalf("identity clauses = %d, want 1 (title prefix only)", len(clauses))
+	}
+	clause, ok := clauses[0].(map[string]any)
+	if !ok {
+		t.Fatalf("identity clause is not an object: %#v", clauses[0])
+	}
+	if _, hasLabels := clause["labels"]; hasLabels {
+		t.Fatalf("identity clause must not constrain labels with label management off: %#v", clause)
+	}
+	if _, hasTitle := clause["title"]; !hasTitle {
+		t.Fatalf("identity clause must keep the title prefix: %#v", clause)
 	}
 }
 

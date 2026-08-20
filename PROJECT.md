@@ -393,6 +393,10 @@ closed, even if its hashes are unchanged since the last run.
 
 - The metadata block must remain intact.
 - The managed description body is owned by this tool.
+- The Linear team may be shared with another sync, so the snapshot query must
+  scope to this tool's own tickets by exact predicates (title prefix, managed
+  label) rather than by matching the fingerprint metadata block, which does not
+  bound the result set.
 - Labels are *not* owned by this tool. Unrelated labels are preserved, and any
   label named in `LINEAR_PROTECTED_LABELS` is treated as another actor's state:
   never written, never deleted, and read live rather than from the snapshot.
