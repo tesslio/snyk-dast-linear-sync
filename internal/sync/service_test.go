@@ -2112,3 +2112,115 @@ func TestRunCountsAmbiguousCommentBatchWithoutRetrying(t *testing.T) {
 		t.Fatalf("FailedOps = %d, want 0: a comment failure is not a state-sync failure", result.FailedOps)
 	}
 }
+
+// TestRunResultErrOnlyFailsOnUnappliedOps pins the exit-status contract: the run
+// fails only when state-changing work was left permanently unapplied. A clean run
+// and a run whose only casualty was an explanatory comment both succeed.
+func TestRunResultErrOnlyFailsOnUnappliedOps(t *testing.T) {
+	if err := (RunResult{PlannedCreates: 5}).Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil for a clean run", err)
+	}
+	if err := (RunResult{FailedComments: 3}).Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil: a missing change comment leaves the synced state correct", err)
+	}
+	err := (RunResult{FailedOps: 2}).Err()
+	if err == nil {
+		t.Fatal("Err() = nil, want an error when Linear operations could not be applied")
+	}
+	if !strings.Contains(err.Error(), "2") {
+		t.Fatalf("Err() = %v, want the failed-operation count in the message", err)
+	}
+}
+
+// TestRunSucceedsWhenBatchFailureIsRecoveredByRetry is the "eventually succeeded
+// is fine" half of the contract. A batch that partially fails and whose retry
+// lands must not fail the run: the sync did apply every operation, it just took
+// two calls.
+func TestRunSucceedsWhenBatchFailureIsRecoveredByRetry(t *testing.T) {
+	// createFailIdx applies to the first batch call only, so the single-entry
+	// retry succeeds.
+	linear := &fakeLinear{createFailIdx: []int{1}}
+
+	result, err := New(baseTestConfig(), discardLogger(), threeOpenFindings(), linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: the retry landed, so nothing was left unapplied", result.FailedOps)
+	}
+	if err := result.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil: a batch failure recovered by retry is a successful run", err)
+	}
+}
+
+// TestRunFailsWhenRetryAlsoFails is the other half: once the per-entry retry has
+// itself failed the issue does not exist, and a run that logs that but reports
+// success means nothing downstream notices.
+func TestRunFailsWhenRetryAlsoFails(t *testing.T) {
+	linear := &fakeLinear{createAlwaysFailIdx: true}
+
+	result, err := New(baseTestConfig(), discardLogger(), threeOpenFindings(), linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.FailedOps != 3 {
+		t.Fatalf("FailedOps = %d, want 3", result.FailedOps)
+	}
+	if result.Err() == nil {
+		t.Fatal("Err() = nil, want an error: three creates never landed")
+	}
+}
+
+// TestRunSucceedsWhenOnlyCommentsFail keeps comment failures out of the exit
+// status end to end, not just in the RunResult unit test: the issue state itself
+// is already correct, and comments are opt-in via LINEAR_COMMENTS.
+func TestRunSucceedsWhenOnlyCommentsFail(t *testing.T) {
+	cfg := baseTestConfig()
+	cfg.Linear.CommentsEnabled = true
+
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       model.Fingerprint("target-a", "su2d3k-1"),
+					SnykDASTFindingID: "su2d3k-1",
+					TargetID:          "target-a",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+				},
+			},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	// A stale title on the existing issue makes the finding produce an update, and
+	// therefore a change comment.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Triage",
+				Fingerprint: model.Fingerprint("target-a", "su2d3k-1"),
+			},
+		},
+		commentBatchErr: errors.New("connection reset by peer"),
+	}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.FailedComments == 0 {
+		t.Fatal("FailedComments = 0, want the dropped comment counted")
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: the update itself applied", result.FailedOps)
+	}
+	if err := result.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil: only an explanatory comment was lost", err)
+	}
+}

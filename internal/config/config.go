@@ -118,6 +118,22 @@ type LabelConfig struct {
 	TargetTypeDefault string
 	CheckType         map[string]string
 	CheckTypeDefault  string
+	// Protected holds labels this sync must never add to, or remove from, an
+	// existing ticket. They belong to other actors — a triage bot, a dispatch
+	// harness, a human workflow — which use them as control state, so deleting
+	// one silently undoes that actor's decision.
+	//
+	// Protection has to be explicit because Linear's issueUpdate replaces a
+	// ticket's whole label set rather than applying a delta: every update echoes
+	// back the label set this sync last saw, which deletes anything another
+	// actor added since the run's opening snapshot. Preserving these therefore
+	// means reading their live state immediately before each update.
+	//
+	// Empty by default: with no protected labels the live read is skipped
+	// entirely, so the extra query stays off the hot path for deployments that
+	// do not need it. Set LINEAR_PROTECTED_LABELS to a comma-separated list to
+	// enable it.
+	Protected []string
 }
 
 type DueDateConfig struct {
@@ -196,6 +212,7 @@ func Load(args []string) (Config, error) {
 				TargetTypeDefault: normalizeManagedLabel(getEnv("LINEAR_TARGET_TYPE_LABEL_DEFAULT", "")),
 				CheckType:         checkTypeLabels,
 				CheckTypeDefault:  normalizeManagedLabel(getEnv("LINEAR_CHECK_TYPE_LABEL_DEFAULT", "")),
+				Protected:         parseLabelList(os.Getenv("LINEAR_PROTECTED_LABELS")),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
@@ -319,6 +336,22 @@ func normalizeManagedLabel(raw string) string {
 	default:
 		return value
 	}
+}
+
+// parseLabelList parses a comma-separated list of label names, dropping empty
+// entries and honouring the same "off"/"none" disable words as
+// normalizeManagedLabel (so LINEAR_PROTECTED_LABELS=off disables protection
+// entirely, overriding any value inherited from an env file). Unlike
+// parseLabelMap it cannot fail: there is no key:value shape to get wrong, so an
+// absent value simply means "no labels".
+func parseLabelList(raw string) []string {
+	var out []string
+	for part := range strings.SplitSeq(raw, ",") {
+		if label := normalizeManagedLabel(part); label != "" {
+			out = append(out, label)
+		}
+	}
+	return out
 }
 
 func parseLabelMap(envName, raw string) (map[string]string, error) {

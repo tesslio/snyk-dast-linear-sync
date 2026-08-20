@@ -75,6 +75,28 @@ type RunResult struct {
 	FailedComments int64
 }
 
+// Err reports whether the run left state-changing work permanently unapplied,
+// so the caller can exit non-zero. A run that logs a failure but reports success
+// is worse than a noisy one: nothing downstream notices the drift, and the next
+// scheduled run reports success again.
+//
+// Only permanent failures count. FailedOps is incremented after the per-entry
+// retry has itself failed (or, for an ambiguous batch create, after the
+// reconciliation query failed and the entries were deliberately left for the
+// next run), so a batch that fails and then succeeds on retry is a clean run and
+// returns nil here.
+//
+// FailedComments is deliberately excluded. A missing change comment leaves the
+// synced issue state correct — the comment is explanatory, and the feature is
+// opt-in via LINEAR_COMMENTS — so it is logged and counted but does not fail the
+// run.
+func (r RunResult) Err() error {
+	if r.FailedOps > 0 {
+		return fmt.Errorf("%d Linear operation(s) could not be applied; see the error log for details", r.FailedOps)
+	}
+	return nil
+}
+
 func New(cfg config.Config, logger *slog.Logger, snykdast SnykDASTClient, linear LinearClient, cacheStore CacheStore) *Service {
 	return &Service{
 		cfg:      cfg,

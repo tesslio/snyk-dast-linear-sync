@@ -22,6 +22,13 @@ import (
 const (
 	titlePrefix    = "Snyk DAST:"
 	metadataHeader = "<!-- snyk-dast-linear-sync"
+
+	// maxLiveLabelPage is how many labels the live label read requests per issue.
+	// It is Linear's per-connection maximum, chosen so the page cannot truncate
+	// in practice; if it does anyway, fetchLabelsByIssueID fails that issue
+	// closed rather than returning a label set a protected label may be missing
+	// from.
+	maxLiveLabelPage = 250
 )
 
 type Client struct {
@@ -448,6 +455,34 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		return err
 	}
 
+	// Re-read the live label set for this batch when any label is protected.
+	// An update replaces the ticket's whole label set, so this read is what
+	// keeps a protected label another actor added since the run's opening
+	// snapshot from being deleted by that replacement.
+	var liveLabels map[string][]model.IssueLabel
+	if len(c.cfg.Labels.Protected) > 0 {
+		issueIDs := make([]string, 0, len(updates))
+		for _, update := range updates {
+			issueIDs = append(issueIDs, update.Existing.ID)
+		}
+		fetched, err := c.fetchLabelsByIssueID(ctx, issueIDs)
+		if err != nil {
+			return err
+		}
+		liveLabels = fetched
+
+		// An issue missing from the read is indistinguishable from one that
+		// genuinely carries no protected label, and guessing wrong deletes
+		// another actor's control label. Fail the batch instead: the caller
+		// already falls back to updating each issue individually, so the rest of
+		// the batch still lands and only the unreadable issue is reported failed.
+		for _, update := range updates {
+			if _, ok := liveLabels[update.Existing.ID]; !ok {
+				return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so protected labels cannot be preserved", update.Existing.Identifier)
+			}
+		}
+	}
+
 	op := gqlclient.NewOperation(updateIssuesMutation(len(updates)))
 	for i, update := range updates {
 		stateID, err := c.StateID(update.Desired.State)
@@ -458,7 +493,7 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		title := update.Desired.Title
 		description := update.Desired.Description
 		priority := int32(update.Desired.Priority)
-		labelIDs, err := c.desiredLabelIDs(update.Existing, update.Desired)
+		labelIDs, err := c.desiredLabelIDs(update.Existing, update.Desired, liveLabels[update.Existing.ID])
 		if err != nil {
 			return err
 		}
@@ -1104,6 +1139,9 @@ query managedIssueLabels($name: String!, $after: String) {
 	return nil
 }
 
+// createLabelIDs resolves the labels stamped on a brand-new issue. A create has
+// no pre-existing label set to replace, so protected labels need no special
+// handling here: there is nothing of another actor's to clobber.
 func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1119,8 +1157,19 @@ func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
 	return out
 }
 
-func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue) ([]string, error) {
+// desiredLabelIDs computes the full label set to write for an update, since
+// Linear's issueUpdate replaces the ticket's labels wholesale rather than
+// applying a delta.
+//
+// live carries the ticket's label set as read immediately before the write (nil
+// when no labels are protected). Protected labels are taken from live and from
+// nowhere else: the `existing` snapshot was taken at the top of the run, so a
+// protected label another actor added since then is absent from it, and echoing
+// that stale set back to Linear would delete the label. Everything else still
+// comes from the snapshot, which is the pre-existing behaviour.
+func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue, live []model.IssueLabel) ([]string, error) {
 	desiredManaged := normalizeManagedLabelNames(desired.ManagedLabels)
+	protected := c.protectedLabelNames()
 	out := make([]string, 0, len(existing.Labels)+len(desiredManaged))
 	seen := make(map[string]struct{}, len(existing.Labels)+len(desiredManaged))
 	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
@@ -1128,9 +1177,30 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		previousManaged[label] = struct{}{}
 	}
 
+	// Protected labels come from the live read below, so skip them here: the
+	// snapshot's view of them is stale in both directions (it can miss one that
+	// was just added, and carry one that was just removed).
 	for _, label := range existing.Labels {
 		normalized := model.NormalizeLabelName(label.Name)
+		if _, isProtected := protected[normalized]; isProtected {
+			continue
+		}
 		if _, managed := previousManaged[normalized]; managed {
+			continue
+		}
+		if _, exists := seen[label.ID]; exists {
+			continue
+		}
+		out = append(out, label.ID)
+		seen[label.ID] = struct{}{}
+	}
+
+	// Carry over every protected label the ticket actually has right now. This
+	// preserves a label another actor added mid-run and equally respects one it
+	// just removed (an absent label is simply never re-added).
+	for _, label := range live {
+		normalized := model.NormalizeLabelName(label.Name)
+		if _, isProtected := protected[normalized]; !isProtected {
 			continue
 		}
 		if _, exists := seen[label.ID]; exists {
@@ -1147,6 +1217,12 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, managedLabel := range desiredManaged {
+		// A protected label must never be asserted from the managed set — that
+		// would let a misconfiguration stamp another actor's control label onto
+		// a ticket that does not have one.
+		if _, isProtected := protected[managedLabel]; isProtected {
+			continue
+		}
 		managedLabelID := c.managedLabelIDs[managedLabel]
 		if managedLabelID == "" {
 			return nil, fmt.Errorf("managed Linear label %q was not resolved", managedLabel)
@@ -1156,6 +1232,108 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		}
 		out = append(out, managedLabelID)
 		seen[managedLabelID] = struct{}{}
+	}
+	return out, nil
+}
+
+// protectedLabelNames returns the configured protected labels as a normalized
+// set for membership tests.
+func (c *Client) protectedLabelNames() map[string]struct{} {
+	if len(c.cfg.Labels.Protected) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(c.cfg.Labels.Protected))
+	for _, label := range c.cfg.Labels.Protected {
+		if normalized := model.NormalizeLabelName(label); normalized != "" {
+			out[normalized] = struct{}{}
+		}
+	}
+	return out
+}
+
+// fetchLabelsByIssueID reads the current label set of specific issues, keyed by
+// issue ID. It is the authority for protected labels immediately before an
+// update, so it deliberately re-queries Linear rather than reusing the run's
+// snapshot.
+//
+// includeArchived is set because an archived ticket can still be the target of
+// an update. The issue side needs no pagination: the update batch size (10)
+// bounds it, and `first` is set from the batch.
+//
+// The label side is a connection and therefore can truncate, so its pageInfo is
+// checked. A truncated label page is not usable as the authority for protected
+// labels — a protected label past the page boundary would be absent from the
+// live read, and the update would then delete it, which is the exact failure
+// this read exists to prevent. Such an issue is therefore omitted from the
+// result, which UpdateIssues treats as unreadable and refuses. Refusing beats
+// paginating here: a nested connection cannot be paged in this one query, and an
+// issue with more than maxLiveLabelPage labels is pathological rather than a
+// case worth serving. The refusal is loud (a warning plus a failed op, which
+// fails the run) instead of silently dropping a label.
+//
+// The complexity cost is roughly maxLiveLabelPage x batch size per update batch,
+// well inside Linear's 10,000-per-query limit.
+func (c *Client) fetchLabelsByIssueID(ctx context.Context, issueIDs []string) (map[string][]model.IssueLabel, error) {
+	if len(issueIDs) == 0 {
+		return nil, nil
+	}
+
+	op := gqlclient.NewOperation(fmt.Sprintf(`
+query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
+  issues(filter: $filter, first: $first, includeArchived: true) {
+    nodes {
+      id
+      labels(first: %d) {
+        nodes {
+          id
+          name
+        }
+        pageInfo {
+          hasNextPage
+        }
+      }
+    }
+  }
+}`, maxLiveLabelPage))
+	op.Var("filter", linearapi.IssueFilter{
+		Id: &linearapi.IDComparator{In: issueIDs},
+	})
+	op.Var("first", len(issueIDs))
+
+	var resp struct {
+		Issues struct {
+			Nodes []struct {
+				ID     string `json:"id"`
+				Labels struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool `json:"hasNextPage"`
+					} `json:"pageInfo"`
+				} `json:"labels"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	}
+	if err := c.execute(ctx, op, &resp); err != nil {
+		return nil, fmt.Errorf("fetch live Linear labels: %w", err)
+	}
+
+	out := make(map[string][]model.IssueLabel, len(resp.Issues.Nodes))
+	for _, node := range resp.Issues.Nodes {
+		if node.Labels.PageInfo.HasNextPage {
+			c.log.Warn("Linear issue carries more labels than one page of the live label read; refusing to update it rather than risk deleting a protected label",
+				slog.String("issue_id", node.ID),
+				slog.Int("page_size", maxLiveLabelPage),
+			)
+			continue
+		}
+		labels := make([]model.IssueLabel, 0, len(node.Labels.Nodes))
+		for _, label := range node.Labels.Nodes {
+			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name})
+		}
+		out[node.ID] = labels
 	}
 	return out, nil
 }

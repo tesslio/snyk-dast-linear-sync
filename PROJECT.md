@@ -155,6 +155,39 @@ target types.
 The metadata block stores the full managed label set so the sync can remove
 stale target-type-derived labels while preserving unrelated manual labels.
 
+`LINEAR_PROTECTED_LABELS` names labels this sync must never add to, or remove
+from, an existing ticket, for labels another actor owns as control state.
+
+- format: comma-separated label names
+- default: empty
+- `off`: disables protection entirely
+
+Linear's `issueUpdate` replaces a ticket's whole label set rather than applying a
+delta, so every update echoes back the label set the run's opening snapshot saw —
+which deletes anything another actor added since. Protection therefore cannot be
+served from the snapshot:
+
+- when any label is protected, each update batch re-reads the live labels of the
+  issues it is about to write, and protected labels are taken from that read and
+  from nowhere else. This preserves one added mid-run and equally respects one
+  removed mid-run (an absent label is never re-added).
+- an issue missing from that read is indistinguishable from one carrying no
+  protected label, so the batch is failed rather than guessed at. The caller
+  already retries issues individually, so only the unreadable issue is reported
+  failed, and it lands in `FailedOps`, which fails the run.
+- the labels connection is checked for truncation (`pageInfo.hasNextPage`) and a
+  truncated page fails the issue closed too: a protected label past the page
+  boundary would be absent from the read and then deleted by the update, which is
+  the exact failure the read exists to prevent. Refusing beats paginating — a
+  nested connection cannot be paged within the one query, and an issue with more
+  than 250 labels is pathological rather than a case worth serving.
+- protected labels are never asserted from the managed set, bounding the blast
+  radius of a misconfiguration.
+- creates need no handling: there is no pre-existing label set to replace.
+
+The live read is skipped when the protected set is empty, keeping the extra query
+off the hot path for deployments that do not need it.
+
 `LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification
 behavior.
 
@@ -310,6 +343,25 @@ idempotency key, so a write that lands between the reconciliation query and the
 retry still duplicates. The duplicate-cancellation pass converges that case on a
 later run.
 
+### Exit Status
+
+`RunResult.Err` decides the process exit status, and it is deliberately narrow:
+the run fails only when state-changing work was left permanently unapplied.
+
+- `FailedOps` is incremented *after* the per-entry retry has itself failed, or
+  after an ambiguous batch create whose reconciliation query failed and whose
+  entries were deliberately left for the next run. So a batch failure recovered
+  by retry leaves it at zero and the run succeeds — the operation applied, it
+  just took two calls. A non-zero count fails the run, because a run that logs a
+  dropped ticket and then reports success means nothing downstream notices, and
+  the next scheduled run reports success again.
+- `FailedComments` is excluded. A missing change comment leaves the synced issue
+  state correct, and the feature is opt-in via `LINEAR_COMMENTS`, so it is counted
+  and logged but does not fail the run.
+
+The check runs after the `sync complete` summary log, so the counts are reported
+regardless of the exit status.
+
 ## SQLite Cache
 
 The SQLite cache stores:
@@ -341,6 +393,9 @@ closed, even if its hashes are unchanged since the last run.
 
 - The metadata block must remain intact.
 - The managed description body is owned by this tool.
+- Labels are *not* owned by this tool. Unrelated labels are preserved, and any
+  label named in `LINEAR_PROTECTED_LABELS` is treated as another actor's state:
+  never written, never deleted, and read live rather than from the snapshot.
 - Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
 
