@@ -690,50 +690,62 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	// Per Linear's NullableDateComparator, Null: true matches records where the
 	// field IS NULL, i.e. issues that have NOT been auto-archived.
 	archivedAtIsNull := true
+
+	// Every managed issue's title is built with the titlePrefix, and the managed
+	// label is stamped at create and re-asserted on every update, so either alone
+	// identifies a managed ticket. Both are kept as alternatives so that losing
+	// one -- a retitled issue, or a label removed by hand -- does not hide the
+	// ticket and mint a duplicate.
+	identityArms := []linearapi.IssueFilter{
+		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
+	}
+	// Only when label management is enabled: with LINEAR_MANAGED_LABEL=off there
+	// is no label to match, and an arm matching nothing would narrow the snapshot
+	// rather than widen it.
+	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
+		identityArms = append(identityArms, linearapi.IssueFilter{
+			Labels: &linearapi.IssueLabelCollectionFilter{
+				Some: &linearapi.IssueLabelFilter{
+					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
+				},
+			},
+		})
+	}
+	c.log.Info("Linear issue snapshot identity scope",
+		slog.String("title_prefix", titlePrefix),
+		slog.String("managed_label", c.cfg.Labels.Managed),
+		slog.Int("identity_arms", len(identityArms)),
+	)
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
 		},
-		Or: []linearapi.IssueFilter{
+		And: []linearapi.IssueFilter{
+			// Archive window. The null arm also matches issues archived manually
+			// or via the API (including trashed ones): those have archivedAt set
+			// but autoArchivedAt null. They are detected by reading archivedAt
+			// back off the issue, not by this filter.
 			{
-				// Not auto-archived, matching the managed title prefix. Note
-				// this arm also matches issues archived manually or via the API
-				// (including trashed ones): those have archivedAt set but
-				// autoArchivedAt null. They are detected by reading archivedAt
-				// back off the issue, not by this filter.
-				Title: &linearapi.StringComparator{
-					StartsWith: new(titlePrefix),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &archivedAtIsNull,
+				Or: []linearapi.IssueFilter{
+					{AutoArchivedAt: &linearapi.NullableDateComparator{Null: &archivedAtIsNull}},
+					{AutoArchivedAt: &linearapi.NullableDateComparator{Gte: &archiveCutoff}},
 				},
 			},
+			// Identity. Both disjuncts are exact predicates -- a title prefix and
+			// a label name -- so the snapshot is bounded to this sync's own
+			// tickets even when the team is shared with another sync.
+			//
+			// The metadata block that carries the fingerprint is deliberately NOT
+			// used as a query predicate. Filtering on `description: { contains }`
+			// did not bound the result set: a run against a team holding another
+			// sync's tickets loaded 59,866 issues for 7 findings, i.e. effectively
+			// the whole team. Linear does not document `description` as
+			// supporting the string comparators at all, so the arm appears to be
+			// ignored rather than applied, silently widening the OR to everything.
+			// The metadata block is still the authority for identity once an issue
+			// is loaded; it just cannot be trusted to select which ones to load.
 			{
-				// Not auto-archived, carrying the managed metadata block.
-				Description: &linearapi.NullableStringComparator{
-					Contains: new(metadataHeader),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &archivedAtIsNull,
-				},
-			},
-			{
-				// Recently auto-archived issues matching the title prefix.
-				Title: &linearapi.StringComparator{
-					StartsWith: new(titlePrefix),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Gte: &archiveCutoff,
-				},
-			},
-			{
-				// Recently auto-archived issues carrying the metadata block.
-				Description: &linearapi.NullableStringComparator{
-					Contains: new(metadataHeader),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Gte: &archiveCutoff,
-				},
+				Or: identityArms,
 			},
 		},
 	}
