@@ -8,7 +8,7 @@ require (
 	github.com/guillermo/linear v0.0.0-20240317201724-e409e96098ab
 	github.com/joho/godotenv v1.5.1
 	golang.org/x/sync v0.22.0
-	modernc.org/sqlite v1.56.0
+	modernc.org/sqlite v1.57.0
 )
 
 require (
