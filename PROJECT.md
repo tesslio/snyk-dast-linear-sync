@@ -11,7 +11,7 @@ github.com/tesslio/snyk-dast-linear-sync
 ```
 
 Snyk DAST is the rebrand of Probely. The tool talks to the Probely REST API
-(current hostnames `api.probely.com` / `app.probely.com`, both configurable)
+(current hostnames `api.probely.com` / `plus.probely.app`, both configurable)
 and is forward-compatible with the Snyk DAST rebrand.
 
 The intended outcome is:
