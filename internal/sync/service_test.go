@@ -171,7 +171,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 					IssueTitle:        "Reflected XSS",
 					Severity:          "high",
 					Status:            model.FindingOpen,
-					IssueURL:          "https://app.probely.com/targets/target-a/findings/1",
+					IssueURL:          "https://plus.probely.app/targets/target-a/findings/1",
 					CreatedAt:         time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
 				},
 				{
@@ -182,7 +182,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 					IssueTitle:        "SQL Injection",
 					Severity:          "low",
 					Status:            model.FindingIgnored,
-					IssueURL:          "https://app.probely.com/targets/target-b/findings/2",
+					IssueURL:          "https://plus.probely.app/targets/target-b/findings/2",
 					CreatedAt:         time.Date(2026, time.August, 1, 9, 0, 0, 0, time.UTC),
 				},
 			},
@@ -273,7 +273,7 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 					IssueTitle:        "Reflected XSS",
 					Severity:          "high",
 					Status:            model.FindingOpen,
-					IssueURL:          "https://app.probely.com/targets/target-a/findings/1",
+					IssueURL:          "https://plus.probely.app/targets/target-a/findings/1",
 					IssueAPIURL:       "https://api.probely.com/findings/1/",
 					CreatedAt:         time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
 				},
@@ -712,7 +712,7 @@ func TestDesiredIssueRendersDASTContext(t *testing.T) {
 		IssueTitle:        "Broken Access Control",
 		Severity:          "high",
 		Status:            model.FindingOpen,
-		IssueURL:          "https://app.probely.com/targets/target-a/findings/1",
+		IssueURL:          "https://plus.probely.app/targets/target-a/findings/1",
 		IssueAPIURL:       "https://api.probely.com/findings/1/",
 		FindingURL:        "https://api.example.com/users/42",
 		Method:            "get",
@@ -750,7 +750,7 @@ func TestDesiredIssueRendersDASTContext(t *testing.T) {
 	if !strings.Contains(desired.Description, "CVSS: `7.5`") {
 		t.Fatalf("description missing CVSS line: %s", desired.Description)
 	}
-	if !strings.Contains(desired.Description, "Snyk DAST: [Open finding](https://app.probely.com/targets/target-a/findings/1)") {
+	if !strings.Contains(desired.Description, "Snyk DAST: [Open finding](https://plus.probely.app/targets/target-a/findings/1)") {
 		t.Fatalf("description missing Snyk DAST link: %s", desired.Description)
 	}
 	if !strings.Contains(desired.Description, "API: [Finding details](https://api.probely.com/findings/1/)") {

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultSnykDASTAppBase      = "https://app.probely.com"
+	defaultSnykDASTAppBase      = "https://plus.probely.app"
 	defaultSnykDASTAPIBase      = "https://api.probely.com"
 	defaultManagedLabel         = "snyk-dast-automation"
 	defaultLinearTodoState      = "Todo"
