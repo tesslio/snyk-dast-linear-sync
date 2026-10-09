@@ -7,7 +7,7 @@ require (
 	github.com/Masterminds/squirrel v1.5.4
 	github.com/guillermo/linear v0.0.0-20240317201724-e409e96098ab
 	github.com/joho/godotenv v1.5.1
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	modernc.org/sqlite v1.59.0
 )
 
