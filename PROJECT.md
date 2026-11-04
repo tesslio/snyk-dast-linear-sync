@@ -202,6 +202,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states as follows:
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
 - `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (due date is the acceptance expiry plus the configured severity offset)
+- `notfixed` after a lapsed acceptance (Snyk DAST reverts an expired acceptance to `notfixed`) -> `Todo` (due date still the remembered acceptance expiry plus the configured severity offset, see Acceptance Memory under SQLite Cache)
 - `accepted` without an `expiration_date` (permanent risk acceptance) -> `Cancelled`
 - `invalid` (false positive) -> `Cancelled`
 - `fixed` -> `Done`
@@ -221,6 +222,12 @@ acceptance was a request to be reminded at the expiry date, so mapping the
 expired state onto a permanent acceptance would cancel the ticket at exactly
 the moment it becomes actionable again. Only an acceptance with no expiry at
 all is treated as permanent.
+
+Snyk DAST does not leave a lapsed acceptance in the `accepted` state for
+long: it reverts the finding to `notfixed` once the expiration date is
+reached. From then on the finding no longer tells the sync when the
+acceptance ended, so the sync remembers the expiry itself (see Acceptance
+Memory under SQLite Cache) and keeps basing the due date on it.
 
 Archived Linear issues are a special case. Linear auto-archives closed issues
 and excludes them from the default issue query, while Snyk DAST retains
@@ -282,7 +289,12 @@ Due dates are derived from the Snyk DAST finding `created_at` timestamp, not
 from when the issue first appears in Linear. For time-limited `accepted`
 findings (snoozed), the due date is instead calculated from the acceptance
 expiry date so the SLA extends to the normal severity offset from when the
-acceptance expires.
+acceptance expires. The expiry keeps being the base after the acceptance has
+lapsed, including once Snyk DAST has reverted the finding to `notfixed` and no
+longer reports the expiry: the sync remembers it (see Acceptance Memory under
+SQLite Cache). Without that memory the due date would fall back to
+`created_at` plus the offset, which is usually already in the past, so a
+ticket that was correctly dated would suddenly read as long overdue.
 
 Default offsets:
 
@@ -369,9 +381,12 @@ The SQLite cache stores:
 - Snyk DAST-side normalized hashes keyed by fingerprint
 - Linear-side normalized hashes keyed by fingerprint
 - a schema signature for the managed issue format
+- the sync's memory of time-limited acceptances, keyed by fingerprint (below)
 
-The cache is used only as an optimization. It should never be the only source
-used to infer real current state.
+The hashes are used only as an optimization and are never the only source
+used to infer real current state. The acceptance memory is the one exception,
+by necessity: it holds what Snyk DAST reported and has since stopped
+reporting.
 
 Normal behavior:
 
@@ -388,6 +403,87 @@ The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`): a finding that became fixed or permanently
 accepted/invalidated while its ticket sat in an open column must still be
 closed, even if its hashes are unchanged since the last run.
+
+### Acceptance Memory
+
+Snyk DAST reverts a finding whose time-limited acceptance has expired to
+`notfixed`, and the expiry is then no longer part of what the finding
+reports, while it is the base of the ticket's due date for good. Whether the
+reverted finding still echoes its past `expiration_date` is not documented,
+and the sync does not depend on it. The `snyk_dast_acceptances` table
+remembers, per fingerprint, the expiry as reported, the instant the
+acceptance stops applying (the end of the expiry day for a date-only value),
+and when Snyk DAST last confirmed the acceptance. Nothing is aged out on
+read. Snyk DAST stays authoritative: the memory only records what it
+previously reported, and a row is forgotten only when Snyk DAST contradicts
+it. Per finding, on every snapshot load:
+
+- a finding reported as `accepted` with an expiry replaces its row with that
+  expiry and refreshes the confirmation time (the latest report wins, so a
+  new acceptance supersedes an older one);
+- a finding reported as `accepted` with no expiry at all (a permanent
+  acceptance) drops its row: the permanent decision supersedes the
+  time-limited one;
+- a finding reported as `accepted` with an `expiration_date` the sync cannot
+  parse says nothing usable: the row is carried forward unchanged, neither
+  confirmed nor contradicted, and a warning names the finding. The finding
+  itself still maps to `Cancelled`, as before;
+- a finding no longer reported as `accepted` keeps a row whose expiry has
+  lapsed without any earlier contradiction, for good, and the remembered
+  expiry is the due-date base whatever state the finding is in (`notfixed`,
+  `retesting`, `fixed`, `invalid`);
+- a finding no longer reported as `accepted` while the remembered expiry is
+  still ahead contradicts the memory: the acceptance was revoked (or the
+  finding was fixed or invalidated before the acceptance ran out). The first
+  such observation is recorded in the row (`contradicted_at`), so the expiry
+  passing later does not turn the revocation into a lapse. The row is kept,
+  and its expiry applied, for seven days of grace from the last confirmation,
+  so a partial or stale response does not move the due date, then dropped and
+  logged whether or not the expiry has passed since. A finding reported as
+  `accepted` again clears the record and refreshes the confirmation;
+- a fingerprint absent from the snapshot (its target was deleted) keeps its
+  row unchanged: Snyk DAST said nothing about it, and the row is inert. Only
+  an observed non-accepted state before the expiry counts as a contradiction,
+  since Snyk DAST reverts the state itself at expiry.
+
+A row without a usable confirmation time is kept; its grace clock starts on
+the next run that sees it. A memory that cannot be read or written fails the
+snapshot load before any Linear reconciliation: a newly reported acceptance
+must be remembered before it becomes a due-date base, and a finding must not
+be reconciled from a partial memory. `--bypass-cache` bypasses the hashes
+only; it does not touch the acceptance memory. The memory is refreshed on dry
+runs too, since it records what Snyk DAST reported rather than anything the
+sync did.
+
+### Cold-Start Guard
+
+With an empty acceptance memory, the sync cannot tell an earlier due date
+that is a real change from one that merely reflects an expiry it no longer
+knows about. A run that starts with no remembered acceptances while the
+Linear snapshot holds managed open tickets with due dates therefore engages a
+guard: for a matched open ticket whose desired due date is earlier than its
+current one, the current date is kept this run (the reason says why) and the
+run warns with the count, reported as `held_due_dates`. Later dates still
+apply. Before loading can populate the memory, `acceptances_memory_state` in
+`sync_meta` records a pending empty start. Both sync and diagnostic loads
+preserve this evidence across failures or interruptions, even when rows were
+already committed. After a successful pair of snapshots, an open dated ticket
+promotes that pending state to the `acceptances_cold_start_at` guard;
+otherwise the memory is marked trusted and no guard is engaged. The guard
+holds until `--clear-acceptances-cold-start` records trusted memory and
+removes the marker. Trust persists even when the table stays empty, including
+on subsequent normal runs. Deleting only the guard key does not release
+pending memory; use the flag.
+
+The guard is for a lost memory, not a new one. A cache a previous run wrote
+(the snapshot save records the schema signature and the hash rows on every
+successful run) but that has no acceptance rows is an upgrade from a version
+without the memory: no expiry was ever remembered, so none was lost, the
+memory is marked trusted from the start and earlier due dates are written as
+usual. Only a cache with no prior run data (a new file, or an Actions cache
+miss) records a pending start. Either way the memory can only remember what
+it has seen: a ticket whose due date had already regressed is not moved later
+until Snyk DAST reports the acceptance again.
 
 ## Safety Assumptions
 
@@ -430,6 +526,15 @@ full live reconciliation:
 
 ```bash
 go run ./cmd/snyk-dast-linear-sync --env-file .env --bypass-cache
+```
+
+Cache bypass does not touch the acceptance memory. After a run has warned that
+the acceptance memory was cold, release the held due dates once the memory is
+trusted (for example after the acceptances have been re-seeded from Snyk DAST
+and checked):
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env --clear-acceptances-cold-start
 ```
 
 ## Design Boundaries
