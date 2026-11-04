@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/httpx"
@@ -24,6 +25,20 @@ type Client struct {
 	apiBase     *url.URL
 	logger      *slog.Logger
 	concurrency int
+	// memory, when set, remembers time-limited acceptances across runs so a
+	// lapsed acceptance keeps being the due-date base after Snyk DAST
+	// reverts the finding to notfixed (see acceptanceMemory).
+	memory AcceptanceStore
+	// now, when set, replaces time.Now for the acceptance memory decisions,
+	// so tests can simulate the passage of days.
+	now func() time.Time
+}
+
+// SetCache attaches the SQLite cache so the client remembers time-limited
+// acceptances across runs. Without it, a lapsed acceptance is forgotten as
+// soon as Snyk DAST reverts the finding to notfixed.
+func (c *Client) SetCache(store AcceptanceStore) {
+	c.memory = store
 }
 
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, error) {

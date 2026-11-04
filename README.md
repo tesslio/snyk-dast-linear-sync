@@ -20,8 +20,8 @@ github.com/tesslio/snyk-dast-linear-sync
 - Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
 - Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk DAST target still exists.
 - Cancels managed Linear issues when their Snyk DAST target no longer exists, such as after target deletion.
-- Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
-- Sets Linear due dates from Snyk DAST finding creation time using configurable per-severity offsets.
+- Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs, and as its memory of time-limited acceptances that Snyk DAST has since reverted (see [Cache Behavior](#cache-behavior)).
+- Sets Linear due dates from Snyk DAST finding creation time using configurable per-severity offsets, or from the acceptance expiry for a finding that is or was under a time-limited acceptance (see [Due Dates](#due-dates)).
 
 The fingerprint format is:
 
@@ -88,6 +88,12 @@ Bypass cache:
 
 ```bash
 go run ./cmd/snyk-dast-linear-sync --env-file .env --bypass-cache
+```
+
+Release due dates held back by the acceptance-memory cold-start guard (see [Cache Behavior](#cache-behavior)):
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env --clear-acceptances-cold-start
 ```
 
 `--env-file` uses `github.com/joho/godotenv`, so the file can be a normal dotenv file and does not need to be sourced by your shell.
@@ -297,6 +303,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states:
 - `notfixed` / `retesting` -> `Todo`
 - `accepted` with a future `expiration_date` -> `Todo` (SLA from acceptance expiry)
 - `accepted` with a past `expiration_date` -> `Todo` (the acceptance has lapsed; the due date is the acceptance expiry plus the configured severity offset, the same basis used while the acceptance was in force). A date-only `expiration_date` covers the whole of that day, so the acceptance lapses at the end of it, not at midnight.
+- `notfixed` after a lapsed acceptance -> `Todo`, with the same due date. Snyk DAST reverts an expired acceptance to `notfixed`, and the sync remembers the expiry (see [Acceptance memory](#acceptance-memory)).
 - `accepted` without an `expiration_date` -> `Cancelled`
 - `invalid` -> `Cancelled`
 - `fixed` -> `Done`
@@ -308,7 +315,7 @@ The configured Linear state names are resolved by name first, then by workflow t
 These distinctions are intentional:
 
 - A time-limited `accepted` finding is kept open in `Todo` because it requires attention once the acceptance expires. Its due date is calculated from the acceptance expiry so the SLA extends to the normal severity offset from when the acceptance ends.
-- Once that acceptance has lapsed, the finding stays in `Todo` rather than being cancelled. A time-limited acceptance is a request to be reminded, so treating an expired one as a permanent acceptance would silently close the ticket at exactly the moment it needs attention.
+- Once that acceptance has lapsed, the finding stays in `Todo` rather than being cancelled. A time-limited acceptance is a request to be reminded, so treating an expired one as a permanent acceptance would silently close the ticket at exactly the moment it needs attention. Snyk DAST itself reverts the finding to `notfixed` when the expiration date is reached, so the lapsed `accepted` state is short-lived; the due date does not change when that happens, because the sync remembers the expiry.
 - A permanently `accepted` (no expiry) or `invalid` finding is cancelled: it is no longer actionable.
 - If a Snyk DAST finding disappears but the target still exists, the tool treats that as the finding being resolved and moves the Linear ticket to `Done`.
 - If the Snyk DAST target itself is gone, the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
@@ -420,7 +427,13 @@ Default due date offsets:
 The base date is normally the Snyk DAST finding `created_at` timestamp. For
 time-limited `accepted` findings, the base date is the acceptance expiry date,
 so the due date extends to the normal severity SLA calculated from when the
-acceptance expires.
+acceptance expires. That stays true after the acceptance has lapsed, and after
+Snyk DAST has reverted the finding to `notfixed` and stopped reporting the
+expiry: the sync remembers the expiry in its cache (see
+[Acceptance memory](#acceptance-memory)), so the due date does not regress to
+`created_at` + SLA. Without the memory, that regression turned a correctly
+dated ticket into one that read as long overdue the moment the acceptance ran
+out.
 
 Past due dates are left as-is (Linear renders them as overdue) rather than
 floored to today, both to show how long an issue has exceeded its SLA and to
@@ -433,6 +446,7 @@ The cache lives in SQLite and stores:
 - a schema signature for the managed issue format
 - a normalized hash for each Snyk DAST finding
 - a normalized hash for each managed Linear issue
+- the sync's memory of time-limited acceptances, per fingerprint
 
 On a normal run:
 
@@ -443,8 +457,66 @@ On a normal run:
 5. Refresh the cache from the live post-write Linear snapshot.
 
 The cache fast-path never suppresses a pending move into a terminal state
-(`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
-rebuild it from live data.
+(`Done`/`Cancelled`). Use `--bypass-cache` to ignore the hashes for a run and
+rebuild them from live data. It does not touch the acceptance memory.
+
+### Acceptance memory
+
+Snyk DAST reverts a finding whose time-limited acceptance has run out to
+`notfixed`, and from then on the finding no longer tells the sync when the
+acceptance ended, while that expiry stays the base of the ticket's due date.
+Whether the reverted finding still echoes its past `expiration_date` is not
+documented, and the sync does not rely on it. The sync therefore remembers
+each time-limited acceptance it has seen (the expiry, when it stops applying,
+and when Snyk DAST last confirmed it) and keeps a row until Snyk DAST
+contradicts it, judged on every snapshot load against the live finding:
+
+- a finding Snyk DAST still reports as accepted with an expiry refreshes its
+  row (the latest report wins, so a new acceptance replaces an older one);
+- a finding reported as permanently accepted (no expiry) drops its row;
+- a finding no longer reported as accepted keeps a lapsed expiry for good, and
+  that expiry stays the due-date base whatever state the finding is in;
+- a finding no longer reported as accepted while the remembered expiry is
+  still ahead was un-accepted early (revoked, fixed or invalidated). Its row
+  is kept for seven days from the last confirmation, since partial responses
+  happen, then dropped as revoked, with a log line;
+- a finding absent from the snapshot keeps its row unchanged.
+
+A memory that cannot be read or written fails the snapshot load before any
+Linear reconciliation. Dry runs refresh the memory too: it records what Snyk
+DAST reported, not anything the sync wrote.
+
+### Cold-start guard
+
+A run that starts with an empty acceptance memory (a new or lost cache file,
+or the first run of a version that has one) while Linear already holds open
+tickets with due dates cannot tell an earlier due date that is a real change
+from one that only reflects an expiry it no longer remembers. Such a run keeps
+the current due date of any matched open ticket whose desired date is earlier,
+logs a warning with the count (`held_due_dates` in the summary), and leaves an
+`acceptances_cold_start_at` marker in the cache so later runs keep holding
+too. Later due dates still apply. Once the memory is trusted again, release
+the held dates with:
+
+```bash
+go run ./cmd/snyk-dast-linear-sync --env-file .env --clear-acceptances-cold-start
+```
+
+The cache records a pending empty start under the `acceptances_memory_state`
+key in `sync_meta` before any snapshot loader can seed rows, including
+diagnostic loads. Failed or interrupted loads keep that evidence for the next
+run. A successful load with no open dated tickets marks the memory trusted
+without engaging the guard.
+
+The clear flag records that the memory is trusted and removes the cold-start
+marker. This release persists even when there are no acceptances to remember,
+so the next normal run stays released. Deleting only `acceptances_cold_start_at`
+does not release pending memory; use the flag.
+
+The memory can only remember what it has seen. A ticket whose due date had
+already regressed before this memory existed is corrected the next time Snyk
+DAST reports the acceptance (for example after it is re-accepted), not
+retroactively.
 
 ## Configuration
 
@@ -457,6 +529,10 @@ Required:
 Optional:
 
 - `--env-file`
+- `--dry-run`
+- `--verbose`
+- `--bypass-cache`
+- `--clear-acceptances-cold-start`
 - `SNYK_DAST_API_BASE`
 - `SNYK_DAST_APP_BASE`
 - `SNYK_DAST_TEAM`
@@ -489,8 +565,9 @@ See [.env.example](/.env.example).
 
 `cmd/investigate-duedate` is a helper for inspecting the due-date decision for a
 single managed Linear issue. It loads the issue by identifier, finds the
-matching Snyk DAST finding, and prints every plausible due-date scenario plus
-the cache state:
+matching Snyk DAST finding (reading and refreshing the same acceptance memory
+the sync uses, so a remembered expiry is reported as such), and prints every
+plausible due-date scenario plus the cache state:
 
 ```bash
 go run ./cmd/investigate-duedate --env-file .env --issue SEC-12127
@@ -521,6 +598,7 @@ summary is emitted before the exit status is decided.
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
+- The final `sync complete` line reports `findings`, `existing_issues`, `conflicts`, `held_due_dates`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, `failed_ops`, and `failed_comments`. A dropped remembered acceptance and an engaged cold-start guard are logged too.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-dast-linear-sync-errors.log`
 

@@ -64,6 +64,10 @@ func main() {
 	cacheStore, cacheErr := cache.Open(cfg.Cache.DBFile)
 	if cacheErr == nil {
 		defer cacheStore.Close()
+		// The diagnostic load reads and refreshes the same acceptance memory
+		// the sync uses, so the due date it reports is the one the sync
+		// would compute.
+		snykdast.SetCache(cacheStore)
 	}
 
 	linear := linearclient.New(cfg.Linear, cfg.Sync.LinearConcurrency, logger.With("service", "linear"))
@@ -211,6 +215,7 @@ func printDiagnostics(diag syncsvc.DueDateDiagnostics, cacheSnapshot cache.Snaps
 	fmt.Printf("  Method/Path:      %s %s\n", diag.Finding.Method, diag.Finding.Path)
 	fmt.Printf("  Created at:       %s\n", formatTime(diag.Finding.CreatedAt))
 	fmt.Printf("  Acceptance expiry: %s\n", formatTime(diag.Finding.IgnoreExpiresAt))
+	fmt.Printf("  Acceptance remembered from cache: %v\n", diag.Finding.AcceptanceRemembered)
 	fmt.Println()
 
 	fmt.Println("Due date scenarios:")

@@ -38,7 +38,7 @@ func TestMapStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, expires := mapStatus(tc.state, tc.expirationDate)
+			got, expires, _ := mapStatus(tc.state, tc.expirationDate, time.Now())
 			if got != tc.want {
 				t.Fatalf("mapStatus() = %q, want %q", got, tc.want)
 			}
@@ -54,7 +54,7 @@ func TestMapStatus(t *testing.T) {
 
 func TestMapStatusSnoozedParsesExpiry(t *testing.T) {
 	expiry := "2126-06-01"
-	_, expires := mapStatus("accepted", &expiry)
+	_, expires, _ := mapStatus("accepted", &expiry, time.Now())
 	want := time.Date(2126, time.June, 1, 0, 0, 0, 0, time.UTC)
 	if !expires.Equal(want) {
 		t.Fatalf("expires = %v, want %v", expires, want)
@@ -161,7 +161,7 @@ func TestMapStatusDateOnlyExpiryCoversItsFinalDay(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, expires := mapStatus("accepted", &tc.date)
+			got, expires, _ := mapStatus("accepted", &tc.date, time.Now())
 			if got != tc.want {
 				t.Fatalf("mapStatus(accepted, %q) = %q, want %q", tc.date, got, tc.want)
 			}
@@ -184,10 +184,10 @@ func TestMapStatusRFC3339ExpiryUsesItsOwnTime(t *testing.T) {
 	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 
-	if got, _ := mapStatus("accepted", &past); got != model.FindingOpen {
+	if got, _, _ := mapStatus("accepted", &past, time.Now()); got != model.FindingOpen {
 		t.Fatalf("mapStatus(accepted, one hour ago) = %q, want %q", got, model.FindingOpen)
 	}
-	if got, _ := mapStatus("accepted", &future); got != model.FindingSnoozed {
+	if got, _, _ := mapStatus("accepted", &future, time.Now()); got != model.FindingSnoozed {
 		t.Fatalf("mapStatus(accepted, one hour ahead) = %q, want %q", got, model.FindingSnoozed)
 	}
 }

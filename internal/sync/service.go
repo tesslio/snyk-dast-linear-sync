@@ -37,6 +37,40 @@ type LinearClient interface {
 type CacheStore interface {
 	Load(ctx context.Context) (cache.Snapshot, error)
 	Save(ctx context.Context, snapshot cache.Snapshot) error
+	// HasAcceptanceRows reports whether the Snyk DAST loader's acceptance
+	// memory holds any row; GetMeta, SetMeta and DeleteMeta access the
+	// sync_meta table. The cold-start guard uses all four.
+	HasAcceptanceRows(ctx context.Context) (bool, error)
+	GetMeta(ctx context.Context, key string) (string, bool, error)
+	SetMeta(ctx context.Context, key, value string) error
+	DeleteMeta(ctx context.Context, key string) error
+}
+
+// acceptancesColdStartMetaKey is the sync_meta key the cold-start guard sets
+// when it engages. Its value is the RFC3339 time it engaged. The guard holds
+// until an operator clears the key (--clear-acceptances-cold-start).
+const acceptancesColdStartMetaKey = "acceptances_cold_start_at"
+
+// coldStartGuard protects due dates against an empty acceptance memory. The
+// Snyk DAST loader's memory is the only record of a lapsed acceptance once
+// Snyk DAST has reverted the finding to notfixed, so on a run that starts
+// with no remembered acceptances (a new or lost cache file) an earlier due
+// date the sync computes for an existing ticket may only reflect that
+// forgotten expiry, not a real change. While the guard holds, a matched open
+// ticket keeps its due date when the desired one is earlier; later dates
+// still apply.
+type coldStartGuard struct {
+	// active is set when the marker is in the cache, or when the acceptance
+	// memory was empty at run start while Linear holds managed open tickets
+	// with due dates (the marker is then written).
+	active bool
+	// tableEmpty records an untrusted empty start, including a previous load
+	// that seeded rows before failing.
+	tableEmpty bool
+	// since is the marker's value: when the guard engaged.
+	since string
+	// held counts the due dates kept this run.
+	held int64
 }
 
 type Service struct {
@@ -56,9 +90,13 @@ var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
-	Findings            int
-	ExistingIssues      int
-	Conflicts           int
+	Findings       int
+	ExistingIssues int
+	Conflicts      int
+	// HeldDueDates counts matched open tickets whose earlier desired due
+	// date was not written because the acceptance-memory cold-start guard
+	// holds (see coldStartGuard). Zero when the guard is not engaged.
+	HeldDueDates        int64
 	PlannedCreates      int64
 	PlannedUpdates      int64
 	PlannedResolves     int64
@@ -139,6 +177,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	guard, err := s.acceptancesColdStartGuard(ctx)
+	if err != nil {
+		return RunResult{}, err
+	}
+
 	s.logger.Info("loading Snyk DAST findings and Linear snapshot")
 	loadGroup, loadCtx := errgroup.WithContext(ctx)
 	loadGroup.Go(func() error {
@@ -162,6 +205,28 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		slog.Int("findings", len(findings)),
 		slog.Int("existing_issues", len(existingIssues)),
 	)
+
+	if !guard.active && guard.tableEmpty && hasOpenTicketWithDueDate(existingIssues, s.cfg.Linear.States) {
+		// The sync has no memory of lapsed acceptances while Linear already
+		// holds tickets whose due dates may have been based on one. Engage
+		// the guard and remember it: later runs have a populated memory but
+		// still no record of what Snyk DAST has already reverted.
+		guard.active = true
+		guard.since = time.Now().UTC().Format(time.RFC3339)
+		if err := s.cache.SetMeta(ctx, acceptancesColdStartMetaKey, guard.since); err != nil {
+			return RunResult{}, err
+		}
+		s.logger.Warn("acceptance memory is empty while Linear holds open tickets with due dates; earlier due dates are held back until the cold-start marker is cleared (run with --clear-acceptances-cold-start once the memory is trusted)",
+			slog.String("marker", acceptancesColdStartMetaKey),
+			slog.String("since", guard.since),
+		)
+	}
+
+	if guard.tableEmpty && !guard.active {
+		if err := s.cache.SetMeta(ctx, cache.AcceptanceMemoryStateKey, cache.AcceptanceMemoryTrusted); err != nil {
+			return RunResult{}, err
+		}
+	}
 
 	existingByFingerprint := map[string]model.ExistingIssue{}
 	var duplicatesToCancel []model.ExistingIssue
@@ -205,6 +270,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) && existing.ArchivedAt == nil {
 				desired.PreserveState = true
 			}
+
+			// Cold-start guard: with no memory of lapsed acceptances, an
+			// earlier due date may only mean a forgotten expiry. Keep the
+			// ticket's date; a later date is a real change and still applies.
+			if guard.active && guard.holds(existing, desired, s.cfg.Linear.States) {
+				desired.DueDate = existing.DueDate
+				desired.DueDateBase = existing.DueDate
+				desired.DueDateReason = "kept existing due date: the acceptance memory started empty, so an earlier date may only reflect a forgotten acceptance expiry"
+				guard.held++
+			}
 		}
 
 		desiredByFingerprint[finding.Fingerprint] = desired
@@ -221,6 +296,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
 	result.Conflicts = len(duplicatesToCancel)
+	result.HeldDueDates = guard.held
+	if guard.active {
+		s.logger.Warn("acceptance-memory cold-start guard is holding earlier due dates; clear it with --clear-acceptances-cold-start once the acceptance memory is trusted",
+			slog.String("since", guard.since),
+			slog.Int64("held_due_dates", guard.held),
+		)
+	}
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -1248,6 +1330,71 @@ func normalizeDescriptionForCompare(description string) string {
 // for common variants like "Canceled" → "Cancelled").
 func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
 	return model.NormalizeWorkflowStateName(existingStateName) == model.NormalizeWorkflowStateName(configuredBacklog)
+}
+
+// acceptancesColdStartGuard reads the guard's state at the start of a run:
+// clears the marker when asked, then reports the marker or, without one,
+// whether the memory began empty and still needs reconciliation.
+func (s *Service) acceptancesColdStartGuard(ctx context.Context) (coldStartGuard, error) {
+	var guard coldStartGuard
+	if s.cache == nil {
+		return guard, nil
+	}
+	if s.cfg.Cache.ClearAcceptancesColdStart {
+		// Trust persists even if Snyk DAST has no acceptances to remember, or
+		// loading fails.
+		if err := s.cache.SetMeta(ctx, cache.AcceptanceMemoryStateKey, cache.AcceptanceMemoryTrusted); err != nil {
+			return guard, err
+		}
+		if err := s.cache.DeleteMeta(ctx, acceptancesColdStartMetaKey); err != nil {
+			return guard, err
+		}
+		s.logger.Info("cleared the acceptance-memory cold-start marker; earlier due dates are written again",
+			slog.String("marker", acceptancesColdStartMetaKey),
+		)
+	}
+	since, ok, err := s.cache.GetMeta(ctx, acceptancesColdStartMetaKey)
+	if err != nil {
+		return guard, err
+	}
+	if ok {
+		guard.active = true
+		guard.since = since
+		return guard, nil
+	}
+	pending, err := cache.PrepareAcceptanceMemory(ctx, s.cache)
+	if err != nil {
+		return guard, err
+	}
+	guard.tableEmpty = pending
+	return guard, nil
+}
+
+// holds reports whether the guard keeps the existing ticket's due date: the
+// ticket is open and dated, and the desired date is earlier. Dates compare
+// as YYYY-MM-DD strings.
+func (g coldStartGuard) holds(existing model.ExistingIssue, desired model.DesiredIssue, states config.StateConfig) bool {
+	if existing.DueDate == "" || desired.DueDate == "" || existing.ArchivedAt != nil {
+		return false
+	}
+	if !isNonTerminalLinearState(existing.StateName, states) {
+		return false
+	}
+	return desired.DueDate < existing.DueDate
+}
+
+// hasOpenTicketWithDueDate reports whether any managed, non-archived open
+// ticket in the snapshot carries a due date.
+func hasOpenTicketWithDueDate(issues []model.ExistingIssue, states config.StateConfig) bool {
+	for _, issue := range issues {
+		if issue.Fingerprint == "" || issue.DueDate == "" || issue.ArchivedAt != nil {
+			continue
+		}
+		if isNonTerminalLinearState(issue.StateName, states) {
+			return true
+		}
+	}
+	return false
 }
 
 // isNonTerminalModelState reports whether the desired model state is

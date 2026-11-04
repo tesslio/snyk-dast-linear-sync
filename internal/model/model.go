@@ -67,8 +67,17 @@ type Finding struct {
 	// IgnoreExpiresAt is the expiration date of a Snyk DAST "accepted" finding
 	// that has a time-limited acceptance. It is used as the base for the
 	// SLA due date so the deadline extends to the normal severity offset from
-	// when the acceptance expires.
+	// when the acceptance expires. It stays set after the acceptance has
+	// lapsed, including once Snyk DAST has reverted the finding to `notfixed`
+	// and no longer reports the expiry: the sync remembers it in its cache
+	// (see AcceptanceRemembered). Zero when the finding has no time-limited
+	// acceptance the sync knows of.
 	IgnoreExpiresAt time.Time
+	// AcceptanceRemembered is set when IgnoreExpiresAt comes from the sync's
+	// acceptance memory rather than from the current Snyk DAST response: the
+	// finding is no longer reported as accepted, but the expiry of its last
+	// time-limited acceptance remains the base of its due date.
+	AcceptanceRemembered bool
 }
 
 // SnykDASTSnapshot is the full source-of-truth view used by one sync run.

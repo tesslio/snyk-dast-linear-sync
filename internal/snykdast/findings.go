@@ -12,6 +12,7 @@ import (
 
 	"log/slog"
 
+	"github.com/tesslio/snyk-dast-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 	"golang.org/x/sync/errgroup"
 )
@@ -126,6 +127,26 @@ type paginatedDefinitions struct {
 }
 
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, error) {
+	// The memory of lapsed acceptances is read before anything else and
+	// written back once every finding has been seen. A memory that cannot be
+	// read or written fails the load: a finding whose due date is based on a
+	// remembered expiry must not be reconciled from a partial memory, and a
+	// newly reported acceptance must be remembered before Linear is written.
+	var memory *acceptanceMemory
+	if c.memory != nil {
+		if _, err := cache.PrepareAcceptanceMemory(ctx, c.memory); err != nil {
+			return model.SnykDASTSnapshot{}, fmt.Errorf("prepare acceptance memory: %w", err)
+		}
+		cached, err := c.memory.LoadAcceptances(ctx)
+		if err != nil {
+			return model.SnykDASTSnapshot{}, fmt.Errorf("load acceptance memory: %w", err)
+		}
+		memory = newAcceptanceMemory(cached)
+	} else {
+		memory = newAcceptanceMemory(nil)
+	}
+	now := c.clock()
+
 	targets, err := c.listTargets(ctx)
 	if err != nil {
 		return model.SnykDASTSnapshot{}, err
@@ -175,39 +196,45 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, erro
 			targetType = finding.Target.Type
 		}
 
-		status, ignoreExpiresAt := mapStatus(finding.State, finding.ExpirationDate)
 		findingIDStr := finding.ID.String()
+		fingerprint := model.Fingerprint(targetID, findingIDStr)
+		status, ignoreExpiresAt, remembered := memory.observe(fingerprint, finding.State, finding.ExpirationDate, now)
 
 		normalized = append(normalized, model.Finding{
-			Fingerprint:       model.Fingerprint(targetID, findingIDStr),
-			SnykDASTFindingID: findingIDStr,
-			DefinitionID:      finding.Definition.ID,
-			CreatedAt:         parseTimePtr(finding.CreatedAt),
-			LastFound:         parseTime(finding.LastFound),
-			TargetID:          targetID,
-			TargetName:        coalesce(targetName, finding.Target.Name, targetHost),
-			TargetType:        targetType,
-			TargetURL:         targetURL,
-			TargetHost:        targetHost,
-			IssueTitle:        coalesce(finding.Definition.Name, finding.Definition.ID, findingIDStr),
-			Severity:          mapSeverity(finding.Severity),
-			CVSS:              derefFloat(finding.CVSSScore),
-			CWE:               finding.Definition.CWEID,
-			CWEName:           finding.Definition.CWEName,
-			Fix:               finding.Fix,
-			Evidence:          finding.Evidence,
-			FindingURL:        finding.URL,
-			IssueURL:          c.findingUIURL(targetID, findingIDStr),
-			IssueAPIURL:       c.findingAPIURL(findingIDStr),
-			Status:            status,
-			Method:            finding.Method,
-			Path:              finding.Path,
-			Parameter:         finding.Parameter,
-			InsertionPoint:    finding.Insertion,
-			CheckType:         checkTypeForDefinition(definitions, finding.Definition.ID),
-			IgnoreExpiresAt:   ignoreExpiresAt,
+			Fingerprint:          fingerprint,
+			SnykDASTFindingID:    findingIDStr,
+			DefinitionID:         finding.Definition.ID,
+			CreatedAt:            parseTimePtr(finding.CreatedAt),
+			LastFound:            parseTime(finding.LastFound),
+			TargetID:             targetID,
+			TargetName:           coalesce(targetName, finding.Target.Name, targetHost),
+			TargetType:           targetType,
+			TargetURL:            targetURL,
+			TargetHost:           targetHost,
+			IssueTitle:           coalesce(finding.Definition.Name, finding.Definition.ID, findingIDStr),
+			Severity:             mapSeverity(finding.Severity),
+			CVSS:                 derefFloat(finding.CVSSScore),
+			CWE:                  finding.Definition.CWEID,
+			CWEName:              finding.Definition.CWEName,
+			Fix:                  finding.Fix,
+			Evidence:             finding.Evidence,
+			FindingURL:           finding.URL,
+			IssueURL:             c.findingUIURL(targetID, findingIDStr),
+			IssueAPIURL:          c.findingAPIURL(findingIDStr),
+			Status:               status,
+			Method:               finding.Method,
+			Path:                 finding.Path,
+			Parameter:            finding.Parameter,
+			InsertionPoint:       finding.Insertion,
+			CheckType:            checkTypeForDefinition(definitions, finding.Definition.ID),
+			IgnoreExpiresAt:      ignoreExpiresAt,
+			AcceptanceRemembered: remembered,
 		})
 		correlated = append(correlated, finding.HasSASTCorrelations)
+	}
+
+	if err := c.commitAcceptanceMemory(ctx, memory); err != nil {
+		return model.SnykDASTSnapshot{}, err
 	}
 
 	if err := c.enrichCorrelations(ctx, normalized, correlated); err != nil {
@@ -219,6 +246,41 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, erro
 		TargetIDs:         targetIDs,
 		InactiveTargetIDs: map[string]struct{}{},
 	}, nil
+}
+
+// commitAcceptanceMemory writes the acceptance rows that survive this run and
+// logs the ones Snyk DAST contradicted. The write must succeed before the
+// findings are handed to Linear reconciliation.
+func (c *Client) commitAcceptanceMemory(ctx context.Context, memory *acceptanceMemory) error {
+	rows := memory.rows()
+	if c.memory != nil {
+		if err := c.memory.SaveAcceptances(ctx, rows); err != nil {
+			return fmt.Errorf("persist acceptance memory: %w", err)
+		}
+	}
+	for _, dropped := range memory.dropped {
+		c.logger.Info("dropping remembered acceptance: Snyk DAST no longer reports the finding as accepted while the expiry is still ahead, so the acceptance was revoked",
+			slog.String("fingerprint", dropped.Fingerprint),
+			slog.Time("expires_at", dropped.ExpiresAt),
+			slog.Time("last_confirmed_at", dropped.ConfirmedAt),
+		)
+	}
+	if c.memory != nil {
+		c.logger.Info("refreshed acceptance memory",
+			slog.Int("rows", len(rows)),
+			slog.Int("dropped", len(memory.dropped)),
+		)
+	}
+	return nil
+}
+
+// clock returns the current UTC time, from the injected clock when a test
+// set one.
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
@@ -390,17 +452,6 @@ func (c *Client) listFindings(ctx context.Context) ([]findingNode, error) {
 	return findings, nil
 }
 
-// mapStatus converts a Snyk DAST finding state into the canonical model status.
-//
-//   - notfixed / retesting -> open (retesting is a transient re-verification
-//     state; the vulnerability is still present until proven otherwise)
-//   - fixed -> fixed
-//   - invalid -> ignored (false positive / not a real vulnerability)
-//   - accepted with a future expiration_date -> snoozed (time-limited risk
-//     acceptance); the SLA clock restarts from the acceptance expiry
-//   - accepted without (or past) expiration_date -> ignored (permanent risk
-//     acceptance)
-//
 // correlationNode is one entry from the Snyk Code (SAST) correlation
 // endpoint. The `markdown` field is a pre-rendered human-readable block
 // describing the linked source vulnerability (repo/file/line).
@@ -514,20 +565,43 @@ func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numeric
 	return blocks, nil
 }
 
-func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.Time) {
+// mapStatus converts a Snyk DAST finding state, as the API reports it, into
+// the canonical model status, with the acceptance expiry when there is one:
+//
+//   - notfixed / retesting -> open (retesting is a transient re-verification
+//     state; the vulnerability is still present until proven otherwise)
+//   - fixed -> fixed
+//   - invalid -> ignored (false positive / not a real vulnerability)
+//   - accepted with a future expiration_date -> snoozed (time-limited risk
+//     acceptance); the SLA clock restarts from the acceptance expiry
+//   - accepted with a past expiration_date -> open (lapsed time-limited
+//     acceptance); the SLA is still measured from the expiry
+//   - accepted without (or with an unparseable) expiration_date -> ignored
+//     (permanent risk acceptance)
+//
+// Snyk DAST reverts an accepted finding to `notfixed` once its acceptance
+// expires, so the lapsed branch covers the window before that happens.
+// Afterwards the finding is `notfixed` without an expiry here; the expiry
+// the due date is based on then comes from the sync's acceptance memory
+// (see acceptanceMemory.observe), which wraps this function.
+//
+// expires is the expiry as written and activeUntil the instant the
+// acceptance stops applying (see parseExpirationDate); both are zero when
+// there is no time-limited acceptance.
+func mapStatus(state string, expirationDate *string, now time.Time) (status model.FindingStatus, expires, activeUntil time.Time) {
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "fixed":
-		return model.FindingFixed, time.Time{}
+		return model.FindingFixed, time.Time{}, time.Time{}
 	case "invalid":
-		return model.FindingIgnored, time.Time{}
+		return model.FindingIgnored, time.Time{}, time.Time{}
 	case "accepted":
 		if expirationDate != nil {
 			expires, activeUntil, ok := parseExpirationDate(*expirationDate)
 			if ok {
-				if time.Now().Before(activeUntil) {
+				if now.Before(activeUntil) {
 					// Acceptance still in force: track the finding but do not
 					// treat it as needing attention yet.
-					return model.FindingSnoozed, expires
+					return model.FindingSnoozed, expires, activeUntil
 				}
 				// The acceptance was time-limited and has lapsed. A lapsed
 				// acceptance is not a permanent one: the finding needs
@@ -535,13 +609,13 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 				// expiry date (see issueDueDate). Mapping it to ignored instead
 				// would silently cancel the ticket at the exact moment the team
 				// asked to be reminded about it.
-				return model.FindingOpen, expires
+				return model.FindingOpen, expires, activeUntil
 			}
 		}
 		// An acceptance with no expiry (or an unparseable one) is permanent.
-		return model.FindingIgnored, time.Time{}
+		return model.FindingIgnored, time.Time{}, time.Time{}
 	default: // notfixed, retesting, or unknown
-		return model.FindingOpen, time.Time{}
+		return model.FindingOpen, time.Time{}, time.Time{}
 	}
 }
 

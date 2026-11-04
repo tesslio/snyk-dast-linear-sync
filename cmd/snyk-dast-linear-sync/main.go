@@ -48,6 +48,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 	defer cacheStore.Close()
+	// The acceptance memory lives in the same cache file. It is not subject
+	// to --bypass-cache: bypassing the hashes must not forget the expiry a
+	// due date is based on.
+	snykdast.SetCache(cacheStore)
 
 	linear := linearclient.New(cfg.Linear, cfg.Sync.LinearConcurrency, logger.With("service", "linear"))
 	service := syncsvc.New(cfg, logger.With("service", "sync"), snykdast, linear, cacheStore)
@@ -62,6 +66,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int("findings", result.Findings),
 		slog.Int("existing_issues", result.ExistingIssues),
 		slog.Int("conflicts", result.Conflicts),
+		slog.Int64("held_due_dates", result.HeldDueDates),
 		slog.Int64("planned_creates", result.PlannedCreates),
 		slog.Int64("planned_updates", result.PlannedUpdates),
 		slog.Int64("planned_resolves", result.PlannedResolves),

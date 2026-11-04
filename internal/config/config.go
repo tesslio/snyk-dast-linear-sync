@@ -80,6 +80,10 @@ type LogConfig struct {
 type CacheConfig struct {
 	DBFile      string
 	BypassCache bool
+	// ClearAcceptancesColdStart removes the marker the cold-start guard leaves
+	// in the cache when it finds the acceptance memory empty while Linear
+	// holds open tickets with due dates, releasing the due dates it held back.
+	ClearAcceptancesColdStart bool
 }
 
 type SnykDASTConfig struct {
@@ -156,6 +160,7 @@ func Load(args []string) (Config, error) {
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
 	verbose := fs.Bool("verbose", false, "log each planned create/update/resolve with its title, state, due date, and labels")
 	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
+	clearAcceptancesColdStart := fs.Bool("clear-acceptances-cold-start", false, "clear the acceptance-memory cold-start marker so held-back earlier due dates are written again")
 	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
 
 	if err := fs.Parse(args); err != nil {
@@ -184,8 +189,9 @@ func Load(args []string) (Config, error) {
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
 		Cache: CacheConfig{
-			DBFile:      getEnv("CACHE_DB_FILE", defaultCacheDBFile),
-			BypassCache: *bypassCache,
+			DBFile:                    getEnv("CACHE_DB_FILE", defaultCacheDBFile),
+			BypassCache:               *bypassCache,
+			ClearAcceptancesColdStart: *clearAcceptancesColdStart,
 		},
 		SnykDAST: SnykDASTConfig{
 			APIKey:  os.Getenv("SNYK_DAST_API_KEY"),
