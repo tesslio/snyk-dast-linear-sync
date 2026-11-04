@@ -421,18 +421,30 @@ it. Per finding, on every snapshot load:
 - a finding reported as `accepted` with an expiry replaces its row with that
   expiry and refreshes the confirmation time (the latest report wins, so a
   new acceptance supersedes an older one);
-- a finding reported as `accepted` without an expiry (a permanent acceptance)
-  drops its row: the permanent decision supersedes the time-limited one;
+- a finding reported as `accepted` with no expiry at all (a permanent
+  acceptance) drops its row: the permanent decision supersedes the
+  time-limited one;
+- a finding reported as `accepted` with an `expiration_date` the sync cannot
+  parse says nothing usable: the row is carried forward unchanged, neither
+  confirmed nor contradicted, and a warning names the finding. The finding
+  itself still maps to `Cancelled`, as before;
 - a finding no longer reported as `accepted` keeps a row whose expiry has
-  lapsed, for good, and the remembered expiry is the due-date base whatever
-  state the finding is in (`notfixed`, `retesting`, `fixed`, `invalid`);
+  lapsed without any earlier contradiction, for good, and the remembered
+  expiry is the due-date base whatever state the finding is in (`notfixed`,
+  `retesting`, `fixed`, `invalid`);
 - a finding no longer reported as `accepted` while the remembered expiry is
   still ahead contradicts the memory: the acceptance was revoked (or the
-  finding was fixed or invalidated before the acceptance ran out). The row is
-  kept for seven days of grace from the last confirmation, so a partial or
-  stale response does not move the due date, then dropped and logged;
+  finding was fixed or invalidated before the acceptance ran out). The first
+  such observation is recorded in the row (`contradicted_at`), so the expiry
+  passing later does not turn the revocation into a lapse. The row is kept,
+  and its expiry applied, for seven days of grace from the last confirmation,
+  so a partial or stale response does not move the due date, then dropped and
+  logged whether or not the expiry has passed since. A finding reported as
+  `accepted` again clears the record and refreshes the confirmation;
 - a fingerprint absent from the snapshot (its target was deleted) keeps its
-  row unchanged: Snyk DAST said nothing about it, and the row is inert.
+  row unchanged: Snyk DAST said nothing about it, and the row is inert. Only
+  an observed non-accepted state before the expiry counts as a contradiction,
+  since Snyk DAST reverts the state itself at expiry.
 
 A row without a usable confirmation time is kept; its grace clock starts on
 the next run that sees it. A memory that cannot be read or written fails the

@@ -119,7 +119,6 @@ func testFinding(state string, expirationDate *string) findingNode {
 }
 
 //go:fix inline
-func ptr(s string) *string { return new(s) }
 
 type testHarness struct {
 	api    *fakeAPI
@@ -290,6 +289,135 @@ func TestLoadSnapshotDropsRevokedAcceptanceAfterGrace(t *testing.T) {
 	got = h.load(t, now.AddDate(0, 0, 8), testFinding("notfixed", nil))
 	if !got.IgnoreExpiresAt.IsZero() || got.AcceptanceRemembered {
 		t.Fatalf("day 8: expiry %v remembered %v, want none", got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+}
+
+// TestLoadSnapshotRevocationBeforeExpiryStaysRevokedAfterExpiry: a finding
+// reported as not accepted before its expiry was revoked, and the expiry
+// passing afterwards does not turn that into a lapse. The contradiction is
+// recorded durably; the row is kept (and applied) only until the grace from
+// the last confirmation runs out, then dropped, and the due date falls back
+// to the finding's creation.
+func TestLoadSnapshotRevocationBeforeExpiryStaysRevokedAfterExpiry(t *testing.T) {
+	now := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	expiry := now.AddDate(0, 0, 4) // lapses at the end of day 4
+	h := newTestHarness(t, newMemoryStore())
+	h.load(t, now, testFinding("accepted", new(dateOnly(expiry))))
+
+	got := h.load(t, now.AddDate(0, 0, 1), testFinding("notfixed", nil))
+	if got.Status != model.FindingOpen || !got.IgnoreExpiresAt.Equal(expiry) || !got.AcceptanceRemembered {
+		t.Fatalf("day 1: status %q expiry %v remembered %v, want open with the expiry applied during the grace", got.Status, got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+	if row := h.store.rows[testFingerprint]; !row.ContradictedAt.Equal(now.AddDate(0, 0, 1)) {
+		t.Fatalf("day 1: ContradictedAt = %v, want stamped on the first contradiction", row.ContradictedAt)
+	}
+
+	// Day 6: the expiry has passed, the grace has not.
+	got = h.load(t, now.AddDate(0, 0, 6), testFinding("notfixed", nil))
+	if !got.IgnoreExpiresAt.Equal(expiry) || !got.AcceptanceRemembered {
+		t.Fatalf("day 6: expiry %v remembered %v, want still applied within the grace", got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+	if row := h.store.rows[testFingerprint]; !row.ContradictedAt.Equal(now.AddDate(0, 0, 1)) {
+		t.Fatalf("day 6: ContradictedAt = %v, want the first contradiction kept", row.ContradictedAt)
+	}
+
+	// Day 7: the grace has run out; a lapsed expiry does not rescue the row.
+	got = h.load(t, now.AddDate(0, 0, 7), testFinding("notfixed", nil))
+	if got.Status != model.FindingOpen || !got.IgnoreExpiresAt.IsZero() || got.AcceptanceRemembered {
+		t.Fatalf("day 7: status %q expiry %v remembered %v, want open with no expiry (creation-based due date)", got.Status, got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+	if _, ok := h.store.rows[testFingerprint]; ok {
+		t.Fatalf("day 7: revoked row still remembered: %+v", h.store.rows)
+	}
+	if !strings.Contains(h.logs.String(), "dropping remembered acceptance") {
+		t.Fatalf("day 7: want a log line for the dropped acceptance, got:\n%s", h.logs.String())
+	}
+	got = h.load(t, now.AddDate(0, 0, 30), testFinding("notfixed", nil))
+	if !got.IgnoreExpiresAt.IsZero() {
+		t.Fatalf("day 30: expiry %v, want none", got.IgnoreExpiresAt)
+	}
+}
+
+// TestLoadSnapshotTransientContradictionClearedByReacceptance: a finding
+// reported as not accepted once and then as accepted again (a partial
+// response) loses its contradiction stamp, so when the acceptance later
+// genuinely lapses the expiry is kept for good.
+func TestLoadSnapshotTransientContradictionClearedByReacceptance(t *testing.T) {
+	now := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	expiry := now.AddDate(0, 0, 4)
+	h := newTestHarness(t, newMemoryStore())
+	h.load(t, now, testFinding("accepted", new(dateOnly(expiry))))
+	h.load(t, now.AddDate(0, 0, 1), testFinding("notfixed", nil))
+	if row := h.store.rows[testFingerprint]; row.ContradictedAt.IsZero() {
+		t.Fatal("day 1: want the contradiction stamped")
+	}
+
+	got := h.load(t, now.AddDate(0, 0, 2), testFinding("accepted", new(dateOnly(expiry))))
+	if got.Status != model.FindingSnoozed || got.AcceptanceRemembered {
+		t.Fatalf("day 2: status %q remembered %v, want snoozed from the API", got.Status, got.AcceptanceRemembered)
+	}
+	row := h.store.rows[testFingerprint]
+	if !row.ContradictedAt.IsZero() || !row.ConfirmedAt.Equal(now.AddDate(0, 0, 2)) {
+		t.Fatalf("day 2: row = %+v, want the contradiction cleared and the confirmation refreshed", row)
+	}
+
+	for _, days := range []int{20, 60, 400} {
+		got := h.load(t, now.AddDate(0, 0, days), testFinding("notfixed", nil))
+		if got.Status != model.FindingOpen || !got.IgnoreExpiresAt.Equal(expiry) || !got.AcceptanceRemembered {
+			t.Fatalf("day %d: status %q expiry %v remembered %v, want the genuine lapse kept for good", days, got.Status, got.IgnoreExpiresAt, got.AcceptanceRemembered)
+		}
+	}
+}
+
+// TestLoadSnapshotMalformedExpiryKeepsMemory: an accepted finding whose
+// expiration_date cannot be parsed is not a permanent acceptance; the
+// remembered row is carried forward unchanged (neither confirmed nor
+// contradicted) and the case is logged. Only an absent or empty
+// expiration_date drops the memory.
+func TestLoadSnapshotMalformedExpiryKeepsMemory(t *testing.T) {
+	now := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	expiry := now.AddDate(0, 0, -10)
+	h := newTestHarness(t, newMemoryStore())
+	h.load(t, now, testFinding("accepted", new(dateOnly(expiry))))
+
+	got := h.load(t, now.AddDate(0, 0, 1), testFinding("accepted", new("not-a-date")))
+	if got.Status != model.FindingIgnored {
+		t.Fatalf("malformed: status %q, want ignored (the existing mapping)", got.Status)
+	}
+	if !got.IgnoreExpiresAt.Equal(expiry) || !got.AcceptanceRemembered {
+		t.Fatalf("malformed: expiry %v remembered %v, want the remembered expiry carried forward", got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+	row, ok := h.store.rows[testFingerprint]
+	if !ok || !row.ExpiresAt.Equal(expiry) || !row.ConfirmedAt.Equal(now) || !row.ContradictedAt.IsZero() {
+		t.Fatalf("malformed: row = %+v, %v; want kept unchanged", row, ok)
+	}
+	if !strings.Contains(h.logs.String(), "level=WARN") || !strings.Contains(h.logs.String(), "cannot parse") || !strings.Contains(h.logs.String(), testFingerprint) {
+		t.Fatalf("malformed: want a warning naming the finding, got:\n%s", h.logs.String())
+	}
+
+	got = h.load(t, now.AddDate(0, 0, 2), testFinding("notfixed", nil))
+	if got.Status != model.FindingOpen || !got.IgnoreExpiresAt.Equal(expiry) || !got.AcceptanceRemembered {
+		t.Fatalf("after malformed: status %q expiry %v remembered %v, want the lapsed expiry still remembered", got.Status, got.IgnoreExpiresAt, got.AcceptanceRemembered)
+	}
+
+	// A malformed date on a finding with no memory remembers nothing.
+	fresh := newTestHarness(t, newMemoryStore())
+	got = fresh.load(t, now, testFinding("accepted", new("not-a-date")))
+	if got.Status != model.FindingIgnored || !got.IgnoreExpiresAt.IsZero() || len(fresh.store.rows) != 0 {
+		t.Fatalf("malformed without memory: status %q expiry %v rows %+v, want ignored, none, none", got.Status, got.IgnoreExpiresAt, fresh.store.rows)
+	}
+
+	// An empty expiration_date is a permanent acceptance and drops the row.
+	for _, empty := range []*string{nil, new(""), new("  ")} {
+		h := newTestHarness(t, newMemoryStore())
+		h.load(t, now, testFinding("accepted", new(dateOnly(expiry))))
+		got := h.load(t, now.AddDate(0, 0, 1), testFinding("accepted", empty))
+		if got.Status != model.FindingIgnored || !got.IgnoreExpiresAt.IsZero() || got.AcceptanceRemembered {
+			t.Fatalf("empty %v: status %q expiry %v remembered %v, want ignored with no expiry", empty, got.Status, got.IgnoreExpiresAt, got.AcceptanceRemembered)
+		}
+		if _, ok := h.store.rows[testFingerprint]; ok {
+			t.Fatalf("empty %v: row still remembered: %+v", empty, h.store.rows)
+		}
 	}
 }
 

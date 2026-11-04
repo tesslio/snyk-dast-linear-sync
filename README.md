@@ -473,13 +473,18 @@ contradicts it, judged on every snapshot load against the live finding:
 
 - a finding Snyk DAST still reports as accepted with an expiry refreshes its
   row (the latest report wins, so a new acceptance replaces an older one);
-- a finding reported as permanently accepted (no expiry) drops its row;
+- a finding reported as permanently accepted (no expiry at all) drops its
+  row; one reported as accepted with an expiry the sync cannot parse keeps its
+  row unchanged and is logged (the finding itself is still cancelled, as
+  before);
 - a finding no longer reported as accepted keeps a lapsed expiry for good, and
   that expiry stays the due-date base whatever state the finding is in;
 - a finding no longer reported as accepted while the remembered expiry is
-  still ahead was un-accepted early (revoked, fixed or invalidated). Its row
-  is kept for seven days from the last confirmation, since partial responses
-  happen, then dropped as revoked, with a log line;
+  still ahead was un-accepted early (revoked, fixed or invalidated). The sync
+  records that first contradiction, keeps the row (and applies its expiry)
+  for seven days from the last confirmation, since partial responses happen,
+  then drops it as revoked with a log line, even if the expiry has passed in
+  the meantime. A finding reported as accepted again clears the record;
 - a finding absent from the snapshot keeps its row unchanged.
 
 A memory that cannot be read or written fails the snapshot load before any
@@ -572,7 +577,9 @@ See [.env.example](/.env.example).
 single managed Linear issue. It loads the issue by identifier, finds the
 matching Snyk DAST finding (reading and refreshing the same acceptance memory
 the sync uses, so a remembered expiry is reported as such), and prints every
-plausible due-date scenario plus the cache state:
+plausible due-date scenario plus the cache state. When the cold-start guard
+is engaged, the reported decision is the one the sync would make (the held
+due date) and the date the SLA alone would give is shown separately:
 
 ```bash
 go run ./cmd/investigate-duedate --env-file .env --issue SEC-12127

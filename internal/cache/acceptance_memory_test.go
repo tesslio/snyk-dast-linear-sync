@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestAcceptancesRoundTripAndReplace(t *testing.T) {
 	confirmed := time.Date(2026, time.January, 20, 8, 30, 15, 123456789, time.UTC)
 	before := time.Now().UTC().Add(-time.Second)
 	if err := store.SaveAcceptances(ctx, map[string]AcceptanceMeta{
-		"snyk-dast:target-a:1": {Fingerprint: "snyk-dast:target-a:1", ExpiresAt: expires, ActiveUntil: expires.AddDate(0, 0, 1), ConfirmedAt: confirmed},
+		"snyk-dast:target-a:1": {Fingerprint: "snyk-dast:target-a:1", ExpiresAt: expires, ActiveUntil: expires.AddDate(0, 0, 1), ConfirmedAt: confirmed, ContradictedAt: confirmed.AddDate(0, 0, 2)},
 		"snyk-dast:target-a:2": {Fingerprint: "snyk-dast:target-a:2", ExpiresAt: expires},
 		"snyk-dast:target-a:3": {Fingerprint: "snyk-dast:target-a:3"},
 	}); err != nil {
@@ -45,12 +46,15 @@ func TestAcceptancesRoundTripAndReplace(t *testing.T) {
 		t.Fatalf("LoadAcceptances() returned %d rows, want 2 (the row without an expiry is not stored): %+v", len(loaded), loaded)
 	}
 	first := loaded["snyk-dast:target-a:1"]
-	if !first.ExpiresAt.Equal(expires) || !first.ActiveUntil.Equal(expires.AddDate(0, 0, 1)) || !first.ConfirmedAt.Equal(confirmed) {
-		t.Fatalf("row 1 = %+v, want expiry %v, active until %v, confirmed %v", first, expires, expires.AddDate(0, 0, 1), confirmed)
+	if !first.ExpiresAt.Equal(expires) || !first.ActiveUntil.Equal(expires.AddDate(0, 0, 1)) || !first.ConfirmedAt.Equal(confirmed) || !first.ContradictedAt.Equal(confirmed.AddDate(0, 0, 2)) {
+		t.Fatalf("row 1 = %+v, want expiry %v, active until %v, confirmed %v, contradicted %v", first, expires, expires.AddDate(0, 0, 1), confirmed, confirmed.AddDate(0, 0, 2))
 	}
 	second := loaded["snyk-dast:target-a:2"]
 	if !second.ActiveUntil.Equal(expires) {
 		t.Fatalf("row 2 ActiveUntil = %v, want the expiry when none was given", second.ActiveUntil)
+	}
+	if !second.ContradictedAt.IsZero() {
+		t.Fatalf("row 2 ContradictedAt = %v, want zero (never contradicted)", second.ContradictedAt)
 	}
 	if second.ConfirmedAt.Before(before) {
 		t.Fatalf("row 2 ConfirmedAt = %v, want stamped at save time (after %v)", second.ConfirmedAt, before)
@@ -271,6 +275,57 @@ func TestPrepareAcceptanceMemoryTrustsUpgradedCache(t *testing.T) {
 	}
 	if pending, err := PrepareAcceptanceMemory(ctx, fresh); err != nil || !pending {
 		t.Fatalf("PrepareAcceptanceMemory() on a fresh cache = %v, %v; want pending", pending, err)
+	}
+}
+
+// TestOpenMigratesAcceptancesWithoutContradictedAt: a cache written by the
+// first version of the acceptance table has no contradicted_at column. Open
+// adds it; the existing rows read as never contradicted and are kept, and
+// a later save can stamp them.
+func TestOpenMigratesAcceptancesWithoutContradictedAt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	ctx := context.Background()
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE snyk_dast_acceptances (fingerprint TEXT PRIMARY KEY, expires_at TEXT NOT NULL, active_until TEXT NOT NULL, confirmed_at TEXT)`,
+		`INSERT INTO snyk_dast_acceptances (fingerprint, expires_at, active_until, confirmed_at) VALUES ('snyk-dast:target-a:1', '2026-02-01T00:00:00Z', '2026-02-02T00:00:00Z', '2026-01-20T00:00:00Z')`,
+	} {
+		if _, err := legacy.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on a legacy cache error = %v", err)
+	}
+	defer store.Close()
+	loaded, err := store.LoadAcceptances(ctx)
+	if err != nil {
+		t.Fatalf("LoadAcceptances() error = %v", err)
+	}
+	row, ok := loaded["snyk-dast:target-a:1"]
+	if !ok || row.ExpiresAt.IsZero() || !row.ContradictedAt.IsZero() {
+		t.Fatalf("legacy row = %+v, %v; want kept and never contradicted", row, ok)
+	}
+	row.ContradictedAt = time.Date(2026, time.January, 25, 0, 0, 0, 0, time.UTC)
+	if err := store.SaveAcceptances(ctx, map[string]AcceptanceMeta{row.Fingerprint: row}); err != nil {
+		t.Fatalf("SaveAcceptances() after migration error = %v", err)
+	}
+	loaded, err = store.LoadAcceptances(ctx)
+	if err != nil || !loaded[row.Fingerprint].ContradictedAt.Equal(row.ContradictedAt) {
+		t.Fatalf("stamp after migration = %+v, %v; want %v", loaded[row.Fingerprint], err, row.ContradictedAt)
+	}
+	// Opening again is idempotent.
+	if err := store.migrateAcceptances(ctx); err != nil {
+		t.Fatalf("second migration error = %v", err)
 	}
 }
 

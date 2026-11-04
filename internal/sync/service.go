@@ -49,10 +49,14 @@ type CacheStore interface {
 	DeleteMeta(ctx context.Context, key string) error
 }
 
-// acceptancesColdStartMetaKey is the sync_meta key the cold-start guard sets
+// AcceptancesColdStartMetaKey is the sync_meta key the cold-start guard sets
 // when it engages. Its value is the RFC3339 time it engaged. The guard holds
-// until an operator clears the key (--clear-acceptances-cold-start).
-const acceptancesColdStartMetaKey = "acceptances_cold_start_at"
+// until an operator clears the key (--clear-acceptances-cold-start). Exported
+// so the due-date diagnostic can report what the guard would hold.
+const AcceptancesColdStartMetaKey = "acceptances_cold_start_at"
+
+// coldStartHoldReason is the due-date reason written while the guard holds.
+const coldStartHoldReason = "kept existing due date: the acceptance memory started empty, so an earlier date may only reflect a forgotten acceptance expiry"
 
 // coldStartGuard protects due dates against an empty acceptance memory. The
 // Snyk DAST loader's memory is the only record of a lapsed acceptance once
@@ -218,11 +222,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		// still no record of what Snyk DAST has already reverted.
 		guard.active = true
 		guard.since = time.Now().UTC().Format(time.RFC3339)
-		if err := s.cache.SetMeta(ctx, acceptancesColdStartMetaKey, guard.since); err != nil {
+		if err := s.cache.SetMeta(ctx, AcceptancesColdStartMetaKey, guard.since); err != nil {
 			return RunResult{}, err
 		}
 		s.logger.Warn("acceptance memory is empty while Linear holds open tickets with due dates; earlier due dates are held back until the cold-start marker is cleared (run with --clear-acceptances-cold-start once the memory is trusted)",
-			slog.String("marker", acceptancesColdStartMetaKey),
+			slog.String("marker", AcceptancesColdStartMetaKey),
 			slog.String("since", guard.since),
 		)
 	}
@@ -279,10 +283,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// Cold-start guard: with no memory of lapsed acceptances, an
 			// earlier due date may only mean a forgotten expiry. Keep the
 			// ticket's date; a later date is a real change and still applies.
-			if guard.active && guard.holds(existing, desired, s.cfg.Linear.States) {
-				desired.DueDate = existing.DueDate
-				desired.DueDateBase = existing.DueDate
-				desired.DueDateReason = "kept existing due date: the acceptance memory started empty, so an earlier date may only reflect a forgotten acceptance expiry"
+			if guard.active && holdDueDate(existing, &desired, s.cfg.Linear.States) {
 				guard.held++
 			}
 		}
@@ -1351,14 +1352,14 @@ func (s *Service) acceptancesColdStartGuard(ctx context.Context) (coldStartGuard
 		if err := s.cache.SetMeta(ctx, cache.AcceptanceMemoryStateKey, cache.AcceptanceMemoryTrusted); err != nil {
 			return guard, err
 		}
-		if err := s.cache.DeleteMeta(ctx, acceptancesColdStartMetaKey); err != nil {
+		if err := s.cache.DeleteMeta(ctx, AcceptancesColdStartMetaKey); err != nil {
 			return guard, err
 		}
 		s.logger.Info("cleared the acceptance-memory cold-start marker; earlier due dates are written again",
-			slog.String("marker", acceptancesColdStartMetaKey),
+			slog.String("marker", AcceptancesColdStartMetaKey),
 		)
 	}
-	since, ok, err := s.cache.GetMeta(ctx, acceptancesColdStartMetaKey)
+	since, ok, err := s.cache.GetMeta(ctx, AcceptancesColdStartMetaKey)
 	if err != nil {
 		return guard, err
 	}
@@ -1386,6 +1387,20 @@ func (g coldStartGuard) holds(existing model.ExistingIssue, desired model.Desire
 		return false
 	}
 	return desired.DueDate < existing.DueDate
+}
+
+// holdDueDate applies the engaged guard to one desired issue: when holds
+// says so, the existing ticket's due date is kept and the reason says why.
+// It reports whether the date was held. Shared with the due-date diagnostic
+// so it reports the outcome the sync would produce.
+func holdDueDate(existing model.ExistingIssue, desired *model.DesiredIssue, states config.StateConfig) bool {
+	if !(coldStartGuard{active: true}).holds(existing, *desired, states) {
+		return false
+	}
+	desired.DueDate = existing.DueDate
+	desired.DueDateBase = existing.DueDate
+	desired.DueDateReason = coldStartHoldReason
+	return true
 }
 
 // hasOpenTicketWithDueDate reports whether any managed, non-archived open

@@ -128,9 +128,9 @@ func TestRunColdStartGuardHoldsEarlierDueDates(t *testing.T) {
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "held_due_dates=1") {
 		t.Fatalf("cold start: want a warning naming the held count, got:\n%s", logs.String())
 	}
-	since, ok := store.meta[acceptancesColdStartMetaKey]
+	since, ok := store.meta[AcceptancesColdStartMetaKey]
 	if !ok || since == "" {
-		t.Fatalf("cold start: marker %q not set in cache meta: %v", acceptancesColdStartMetaKey, store.meta)
+		t.Fatalf("cold start: marker %q not set in cache meta: %v", AcceptancesColdStartMetaKey, store.meta)
 	}
 
 	// Run 2: the memory has rows now, but the marker still holds.
@@ -155,7 +155,7 @@ func TestRunColdStartGuardHoldsEarlierDueDates(t *testing.T) {
 	// Run 4: the operator clears the marker; the earlier date is written.
 	cfg.Cache.ClearAcceptancesColdStart = true
 	result, linear = run("cleared", finding, []model.ExistingIssue{existing})
-	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+	if _, ok := store.meta[AcceptancesColdStartMetaKey]; ok {
 		t.Fatalf("cleared: marker still set: %v", store.meta)
 	}
 	if len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-01-31" {
@@ -172,7 +172,7 @@ func TestRunColdStartGuardHoldsEarlierDueDates(t *testing.T) {
 	if result, linear = run("released", finding, []model.ExistingIssue{written}); len(linear.updated) != 0 || result.HeldDueDates != 0 {
 		t.Fatalf("released: updated %+v held %d, want steady state", linear.updated, result.HeldDueDates)
 	}
-	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+	if _, ok := store.meta[AcceptancesColdStartMetaKey]; ok {
 		t.Fatalf("released: marker re-set: %v", store.meta)
 	}
 }
@@ -207,7 +207,7 @@ func TestRunUpgradeFromPriorCacheDoesNotEngageGuard(t *testing.T) {
 	if result.HeldDueDates != 0 || strings.Contains(logs.String(), "cold-start") {
 		t.Fatalf("upgrade: HeldDueDates = %d, logs:\n%s", result.HeldDueDates, logs.String())
 	}
-	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+	if _, ok := store.meta[AcceptancesColdStartMetaKey]; ok {
 		t.Fatalf("upgrade: marker set: %v", store.meta)
 	}
 	if state := store.meta[cache.AcceptanceMemoryStateKey]; state != cache.AcceptanceMemoryTrusted {
@@ -230,7 +230,7 @@ func TestRunColdStartGuardNeedsOpenDatedTickets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+	if _, ok := store.meta[AcceptancesColdStartMetaKey]; ok {
 		t.Fatalf("marker set with only a closed dated ticket: %v", store.meta)
 	}
 	if result.HeldDueDates != 0 {
@@ -309,7 +309,7 @@ func TestRunClearColdStartWithNoAcceptancesStaysReleased(t *testing.T) {
 	finding := rememberedFinding()
 	existing := storedIssue("existing-1", "SEC-1", "Todo", desiredIssue(cfg, finding))
 	existing.DueDate = "2026-06-30"
-	store := &fakeCache{meta: map[string]string{acceptancesColdStartMetaKey: "2026-01-01T00:00:00Z"}}
+	store := &fakeCache{meta: map[string]string{AcceptancesColdStartMetaKey: "2026-01-01T00:00:00Z"}}
 	for run := range 2 {
 		linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
 		result, err := New(cfg, discardLogger(), singleFindingSnapshot(finding), linear, store).Run(context.Background())
@@ -321,7 +321,7 @@ func TestRunClearColdStartWithNoAcceptancesStaysReleased(t *testing.T) {
 		if result.HeldDueDates != 0 || len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-01-31" {
 			t.Fatalf("run %d: held %d updates %+v", run, result.HeldDueDates, linear.updated)
 		}
-		if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+		if _, ok := store.meta[AcceptancesColdStartMetaKey]; ok {
 			t.Fatal("marker recreated")
 		}
 		cfg.Cache.ClearAcceptancesColdStart = false

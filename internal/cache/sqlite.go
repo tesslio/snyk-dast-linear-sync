@@ -44,6 +44,13 @@ type AcceptanceMeta struct {
 	// with this expiry. Zero when unknown (a row whose value could not be
 	// parsed): the next write stamps it with the time of that write.
 	ConfirmedAt time.Time
+	// ContradictedAt is when Snyk DAST first reported the finding as not
+	// accepted while ActiveUntil was still ahead: the acceptance was revoked
+	// rather than run out. The stamp outlives the expiry, so the row is
+	// dropped once its grace runs out even if the expiry has passed since.
+	// Zero for a row Snyk DAST never contradicted, and cleared when the
+	// finding is reported as accepted again.
+	ContradictedAt time.Time
 }
 
 type Store struct {
@@ -250,7 +257,8 @@ func (s *Store) init(ctx context.Context) error {
 			fingerprint TEXT PRIMARY KEY,
 			expires_at TEXT NOT NULL,
 			active_until TEXT NOT NULL,
-			confirmed_at TEXT
+			confirmed_at TEXT,
+			contradicted_at TEXT
 		)`,
 	}
 
@@ -258,6 +266,9 @@ func (s *Store) init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize sqlite cache: %w", err)
 		}
+	}
+	if err := s.migrateAcceptances(ctx); err != nil {
+		return fmt.Errorf("initialize sqlite cache: %w", err)
 	}
 
 	query, args, err := s.builder.
@@ -273,6 +284,41 @@ func (s *Store) init(ctx context.Context) error {
 		return fmt.Errorf("initialize sqlite cache: %w", err)
 	}
 
+	return nil
+}
+
+// migrateAcceptances adds the columns the acceptance table gained after it
+// was first created. A row written before contradicted_at existed reads as
+// never contradicted, which is the safe reading: a lapsed expiry is kept,
+// and a future one gets its grace from the next contradiction.
+func (s *Store) migrateAcceptances(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(snyk_dast_acceptances)")
+	if err != nil {
+		return fmt.Errorf("inspect acceptances table: %w", err)
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan acceptances table info: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate acceptances table info: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close acceptances table info: %w", err)
+	}
+	if !columns["contradicted_at"] {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_dast_acceptances ADD COLUMN contradicted_at TEXT"); err != nil {
+			return fmt.Errorf("add contradicted_at column: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -420,7 +466,7 @@ func (s *Store) LoadAcceptances(ctx context.Context) (map[string]AcceptanceMeta,
 	out := make(map[string]AcceptanceMeta)
 
 	query, args, err := s.builder.
-		Select("fingerprint", "expires_at", "active_until", "confirmed_at").
+		Select("fingerprint", "expires_at", "active_until", "confirmed_at", "contradicted_at").
 		From("snyk_dast_acceptances").
 		ToSql()
 	if err != nil {
@@ -435,15 +481,16 @@ func (s *Store) LoadAcceptances(ctx context.Context) (map[string]AcceptanceMeta,
 
 	for rows.Next() {
 		var fingerprint, expiresAtRaw, activeUntilRaw string
-		var confirmedAtRaw sql.NullString
-		if err := rows.Scan(&fingerprint, &expiresAtRaw, &activeUntilRaw, &confirmedAtRaw); err != nil {
+		var confirmedAtRaw, contradictedAtRaw sql.NullString
+		if err := rows.Scan(&fingerprint, &expiresAtRaw, &activeUntilRaw, &confirmedAtRaw, &contradictedAtRaw); err != nil {
 			return nil, fmt.Errorf("scan cache acceptance row: %w", err)
 		}
 		meta := AcceptanceMeta{
-			Fingerprint: fingerprint,
-			ExpiresAt:   parseTimestamp(expiresAtRaw),
-			ActiveUntil: parseTimestamp(activeUntilRaw),
-			ConfirmedAt: parseTimestamp(confirmedAtRaw.String),
+			Fingerprint:    fingerprint,
+			ExpiresAt:      parseTimestamp(expiresAtRaw),
+			ActiveUntil:    parseTimestamp(activeUntilRaw),
+			ConfirmedAt:    parseTimestamp(confirmedAtRaw.String),
+			ContradictedAt: parseTimestamp(contradictedAtRaw.String),
 		}
 		if meta.ExpiresAt.IsZero() {
 			continue
@@ -494,8 +541,8 @@ func (s *Store) SaveAcceptances(ctx context.Context, acceptances map[string]Acce
 		}
 		query, args, err = s.builder.
 			Insert("snyk_dast_acceptances").
-			Columns("fingerprint", "expires_at", "active_until", "confirmed_at").
-			Values(fingerprint, formatTimestamp(meta.ExpiresAt), formatTimestamp(activeUntil), formatTimestamp(confirmedAt)).
+			Columns("fingerprint", "expires_at", "active_until", "confirmed_at", "contradicted_at").
+			Values(fingerprint, formatTimestamp(meta.ExpiresAt), formatTimestamp(activeUntil), formatTimestamp(confirmedAt), formatTimestamp(meta.ContradictedAt)).
 			ToSql()
 		if err != nil {
 			return fmt.Errorf("build insert cache acceptance row: %w", err)

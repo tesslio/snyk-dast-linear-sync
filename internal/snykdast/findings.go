@@ -258,11 +258,17 @@ func (c *Client) commitAcceptanceMemory(ctx context.Context, memory *acceptanceM
 			return fmt.Errorf("persist acceptance memory: %w", err)
 		}
 	}
+	for _, fingerprint := range memory.malformed {
+		c.logger.Warn("accepted finding has an expiration_date the sync cannot parse; treating the finding as permanently accepted and keeping any remembered acceptance unchanged",
+			slog.String("fingerprint", fingerprint),
+		)
+	}
 	for _, dropped := range memory.dropped {
-		c.logger.Info("dropping remembered acceptance: Snyk DAST no longer reports the finding as accepted while the expiry is still ahead, so the acceptance was revoked",
+		c.logger.Info("dropping remembered acceptance: Snyk DAST reported the finding as not accepted before the expiry, so the acceptance was revoked",
 			slog.String("fingerprint", dropped.Fingerprint),
 			slog.Time("expires_at", dropped.ExpiresAt),
 			slog.Time("last_confirmed_at", dropped.ConfirmedAt),
+			slog.Time("contradicted_at", dropped.ContradictedAt),
 		)
 	}
 	if c.memory != nil {

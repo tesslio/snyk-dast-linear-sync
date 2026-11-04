@@ -97,7 +97,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	diag := syncsvc.DiagnoseDueDate(cfg, *finding, existing)
+	// The sync holds an earlier due date while the cold-start marker is in
+	// the cache; report the outcome the sync would produce, not the raw SLA.
+	var opts syncsvc.DiagnoseOptions
+	if cacheErr == nil {
+		since, active, err := cacheStore.GetMeta(ctx, syncsvc.AcceptancesColdStartMetaKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: read cold-start marker: %v\n", err)
+		}
+		opts.ColdStartGuardActive = active
+		opts.ColdStartSince = since
+	}
+	diag := syncsvc.DiagnoseDueDate(cfg, *finding, existing, opts)
 
 	var cacheSnapshot cache.Snapshot
 	if cacheErr == nil {
@@ -229,6 +240,12 @@ func printDiagnostics(diag syncsvc.DueDateDiagnostics, cacheSnapshot cache.Snaps
 	fmt.Printf("  Effective desired due date: %s\n", emptyIf(diag.Desired.DueDate, "(none)"))
 	fmt.Printf("  Desired due date base:      %s\n", emptyIf(diag.Desired.DueDateBase, "(none)"))
 	fmt.Printf("  Due date reason:            %s\n", diag.Desired.DueDateReason)
+	if diag.ColdStartGuardActive {
+		fmt.Printf("  Cold-start guard:           active since %s (clear with --clear-acceptances-cold-start)\n", emptyIf(diag.ColdStartSince, "(unknown)"))
+	}
+	if diag.DueDateHeldByColdStart {
+		fmt.Printf("  Held by cold-start guard:   yes; the SLA alone would give %s (%s)\n", emptyIf(diag.UnguardedDueDate, "(none)"), diag.UnguardedDueDateReason)
+	}
 	fmt.Printf("  Desired state:              %s\n", diag.Desired.State)
 	fmt.Printf("  Would update:               %v\n", diag.WouldUpdate)
 	fmt.Printf("  Pending terminal transition: %v\n", diag.PendingTerminalTransition)

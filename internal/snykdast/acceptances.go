@@ -9,14 +9,14 @@ import (
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
-// revokedAcceptanceGrace is how long a remembered acceptance whose expiry is
-// still ahead is kept after Snyk DAST stops reporting the finding as
-// accepted, before the sync concludes the acceptance was revoked and forgets
-// it. It covers a partial or stale API response. It never applies to a
-// lapsed acceptance (expiry behind): Snyk DAST reverts the finding to
-// `notfixed` once the acceptance expires and no longer reports the expiry,
-// and the remembered row is then the only record of the date the due date is
-// based on.
+// revokedAcceptanceGrace is how long a remembered acceptance is kept after
+// Snyk DAST first reports the finding as not accepted while the expiry is
+// still ahead, before the sync concludes the acceptance was revoked and
+// forgets it. It is measured from the last confirmation and covers a partial
+// or stale API response. It never applies to a genuine lapse: Snyk DAST
+// reverts the finding to `notfixed` once the acceptance expires and no longer
+// reports the expiry, and the remembered row is then the only record of the
+// date the due date is based on.
 const revokedAcceptanceGrace = 7 * 24 * time.Hour
 
 // AcceptanceStore is the cache the Snyk DAST loader remembers time-limited
@@ -38,6 +38,9 @@ type acceptanceMemory struct {
 	next    map[string]cache.AcceptanceMeta
 	seen    map[string]struct{}
 	dropped []cache.AcceptanceMeta
+	// malformed lists the fingerprints of findings reported as accepted with
+	// an expiration_date that could not be parsed, for the commit log.
+	malformed []string
 }
 
 func newAcceptanceMemory(cached map[string]cache.AcceptanceMeta) *acceptanceMemory {
@@ -56,20 +59,30 @@ func newAcceptanceMemory(cached map[string]cache.AcceptanceMeta) *acceptanceMemo
 //
 //   - a finding Snyk DAST reports as accepted with an expiry replaces the
 //     memory with that expiry (the latest report wins, since Snyk DAST is
-//     authoritative), and the expiry is the due-date base;
-//   - a finding Snyk DAST reports as permanently accepted supersedes any
-//     remembered time-limited acceptance, which is dropped;
-//   - a finding no longer reported as accepted keeps a remembered expiry
-//     that has lapsed for good: Snyk DAST reverted it to `notfixed` because
-//     the acceptance ran out, and the expiry stays the due-date base;
+//     authoritative), clears any earlier contradiction, and the expiry is
+//     the due-date base;
+//   - a finding Snyk DAST reports as accepted with no expiry at all (a
+//     permanent acceptance) supersedes any remembered time-limited
+//     acceptance, which is dropped;
+//   - a finding reported as accepted with an expiry that cannot be parsed
+//     says nothing usable: the remembered row is carried forward unchanged
+//     (neither confirmed nor contradicted) and the case is logged;
+//   - a finding no longer reported as accepted whose remembered expiry has
+//     passed, with no contradiction before that, lapsed: Snyk DAST reverted
+//     it to `notfixed` because the acceptance ran out, and the expiry stays
+//     the due-date base for good;
 //   - a finding no longer reported as accepted while the remembered expiry
 //     is still ahead contradicts the memory: the acceptance was revoked (or
-//     the finding was fixed or invalidated). The row is kept for
+//     the finding was fixed or invalidated). The first such observation is
+//     recorded durably, so the expiry passing later does not turn the
+//     revocation into a lapse. The row is kept, and its expiry applied, for
 //     revokedAcceptanceGrace after Snyk DAST last confirmed it, so a partial
 //     response does not move the due date, then dropped.
 //
-// The returned status is the one Snyk DAST's own state maps to; the memory
-// only supplies the expiry, and remembered says when it did.
+// A finding missing from the response is never observed, so it is neither
+// confirmed nor contradicted (see rows). The returned status is the one Snyk
+// DAST's own state maps to; the memory only supplies the expiry, and
+// remembered says when it did.
 func (m *acceptanceMemory) observe(fingerprint, state string, expirationDate *string, now time.Time) (status model.FindingStatus, expires time.Time, remembered bool) {
 	m.seen[fingerprint] = struct{}{}
 	status, expires, activeUntil := mapStatus(state, expirationDate, now)
@@ -83,20 +96,32 @@ func (m *acceptanceMemory) observe(fingerprint, state string, expirationDate *st
 			ConfirmedAt: now,
 		}
 		return status, expires, false
+	case isAcceptedState(state) && expirationDate != nil && strings.TrimSpace(*expirationDate) != "":
+		// Accepted with a date the sync cannot read. Not a permanent
+		// acceptance, and not a confirmation of what is remembered either.
+		m.malformed = append(m.malformed, fingerprint)
+		if !had {
+			return status, time.Time{}, false
+		}
+		m.next[fingerprint] = prev
+		return status, prev.ExpiresAt, true
 	case isAcceptedState(state) || !had:
 		return status, time.Time{}, false
 	}
 
-	if !prev.ActiveUntil.After(now) {
+	if prev.ContradictedAt.IsZero() && !prev.ActiveUntil.After(now) {
 		// Lapsed: the only record of the due-date base, kept for good.
 		m.next[fingerprint] = prev
 		return status, prev.ExpiresAt, true
 	}
+	// Contradicted: now, or on an earlier run. The stamp outlives the
+	// expiry, so a revocation does not become a lapse once the date passes.
+	if prev.ContradictedAt.IsZero() {
+		prev.ContradictedAt = now
+	}
 	if prev.ConfirmedAt.IsZero() {
 		// Unknown confirmation time: the grace clock starts this run.
 		prev.ConfirmedAt = now
-		m.next[fingerprint] = prev
-		return status, prev.ExpiresAt, true
 	}
 	if now.Sub(prev.ConfirmedAt) >= revokedAcceptanceGrace {
 		m.dropped = append(m.dropped, prev)
