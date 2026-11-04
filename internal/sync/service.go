@@ -41,6 +41,9 @@ type CacheStore interface {
 	// memory holds any row; GetMeta, SetMeta and DeleteMeta access the
 	// sync_meta table. The cold-start guard uses all four.
 	HasAcceptanceRows(ctx context.Context) (bool, error)
+	// HasPriorRunData reports whether a previous run wrote the cache, which
+	// tells an upgrade (nothing to protect) from a lost cache file.
+	HasPriorRunData(ctx context.Context) (bool, error)
 	GetMeta(ctx context.Context, key string) (string, bool, error)
 	SetMeta(ctx context.Context, key, value string) error
 	DeleteMeta(ctx context.Context, key string) error
@@ -54,11 +57,13 @@ const acceptancesColdStartMetaKey = "acceptances_cold_start_at"
 // coldStartGuard protects due dates against an empty acceptance memory. The
 // Snyk DAST loader's memory is the only record of a lapsed acceptance once
 // Snyk DAST has reverted the finding to notfixed, so on a run that starts
-// with no remembered acceptances (a new or lost cache file) an earlier due
+// with no remembered acceptances in a new or lost cache file an earlier due
 // date the sync computes for an existing ticket may only reflect that
 // forgotten expiry, not a real change. While the guard holds, a matched open
 // ticket keeps its due date when the desired one is earlier; later dates
-// still apply.
+// still apply. A cache written by a version without the memory is an
+// upgrade, not a loss, and does not engage the guard (see
+// cache.PrepareAcceptanceMemory).
 type coldStartGuard struct {
 	// active is set when the marker is in the cache, or when the acceptance
 	// memory was empty at run start while Linear holds managed open tickets

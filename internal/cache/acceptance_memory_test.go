@@ -228,6 +228,52 @@ func TestPrepareAcceptanceMemoryRecordsPendingEmptyStart(t *testing.T) {
 	}
 }
 
+// TestPrepareAcceptanceMemoryTrustsUpgradedCache: a cache that a previous
+// run wrote (the snapshot save records the schema signature and the hash
+// rows) but that has no acceptance rows is an upgrade from a version without
+// the memory. Nothing was lost, so the memory is trusted from the start and
+// no cold start is recorded. A cache nothing has written stays pending.
+func TestPrepareAcceptanceMemoryTrustsUpgradedCache(t *testing.T) {
+	ctx := context.Background()
+
+	upgraded := openTestStore(t)
+	if err := upgraded.Save(ctx, Snapshot{
+		SchemaSignature: "sig",
+		SnykDASTHashes:  map[string]string{"snyk-dast:target-a:1": "hash-a"},
+		LinearHashes:    map[string]string{"snyk-dast:target-a:1": "linear-a"},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if prior, err := upgraded.HasPriorRunData(ctx); err != nil || !prior {
+		t.Fatalf("HasPriorRunData() after a snapshot save = %v, %v; want true", prior, err)
+	}
+	if pending, err := PrepareAcceptanceMemory(ctx, upgraded); err != nil || pending {
+		t.Fatalf("PrepareAcceptanceMemory() on an upgraded cache = %v, %v; want trusted", pending, err)
+	}
+	if state, _, _ := upgraded.GetMeta(ctx, AcceptanceMemoryStateKey); state != AcceptanceMemoryTrusted {
+		t.Fatalf("state = %q, want %q", state, AcceptanceMemoryTrusted)
+	}
+
+	// Hash rows alone (a signature-less save) count as prior data too.
+	hashesOnly := openTestStore(t)
+	if _, err := hashesOnly.db.ExecContext(ctx, `INSERT INTO linear_issues (fingerprint, hash) VALUES (?, ?)`, "snyk-dast:target-a:1", "linear-a"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := PrepareAcceptanceMemory(ctx, hashesOnly); err != nil || pending {
+		t.Fatalf("PrepareAcceptanceMemory() with only hash rows = %v, %v; want trusted", pending, err)
+	}
+
+	// A fresh database: Open writes schema_version, which is not prior run
+	// data, so the memory is pending.
+	fresh := openTestStore(t)
+	if prior, err := fresh.HasPriorRunData(ctx); err != nil || prior {
+		t.Fatalf("HasPriorRunData() on a fresh cache = %v, %v; want false", prior, err)
+	}
+	if pending, err := PrepareAcceptanceMemory(ctx, fresh); err != nil || !pending {
+		t.Fatalf("PrepareAcceptanceMemory() on a fresh cache = %v, %v; want pending", pending, err)
+	}
+}
+
 // TestSaveAcceptancesRollsBackFailedReplacement: a failed replacement must
 // leave the previous rows in place rather than an emptied table, since the
 // rows are the only record of lapsed expiries.

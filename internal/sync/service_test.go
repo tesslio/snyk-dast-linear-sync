@@ -65,6 +65,10 @@ type fakeCache struct {
 	meta           map[string]string
 }
 
+func (f *fakeCache) HasPriorRunData(context.Context) (bool, error) {
+	return f.snapshot.SchemaSignature != "" || len(f.snapshot.SnykDASTHashes) > 0 || len(f.snapshot.LinearHashes) > 0, nil
+}
+
 func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
 	return f.snapshot, nil
 }

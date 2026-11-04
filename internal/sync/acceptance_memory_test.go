@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tesslio/snyk-dast-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
@@ -173,6 +174,44 @@ func TestRunColdStartGuardHoldsEarlierDueDates(t *testing.T) {
 	}
 	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
 		t.Fatalf("released: marker re-set: %v", store.meta)
+	}
+}
+
+// TestRunUpgradeFromPriorCacheDoesNotEngageGuard: the first run of this
+// version against a cache a previous version wrote finds the acceptance
+// table empty, but nothing was lost (no expiry was ever remembered), so an
+// earlier due date is a real change and is written, no marker is left, and
+// the memory is trusted. Only a cache with no prior run data (a new or lost
+// file) engages the guard, as TestRunColdStartGuardHoldsEarlierDueDates
+// covers.
+func TestRunUpgradeFromPriorCacheDoesNotEngageGuard(t *testing.T) {
+	cfg := minimalCfg()
+	finding := rememberedFinding()
+	existing := storedIssue("existing-1", "SEC-1", "Todo", desiredIssue(cfg, finding))
+	existing.DueDate = "2026-06-30"
+	store := &fakeCache{snapshot: cache.Snapshot{
+		SchemaSignature: managedSchemaSignature(),
+		SnykDASTHashes:  map[string]string{"snyk-dast:target-a:9": "stale"},
+		LinearHashes:    map[string]string{"snyk-dast:target-a:9": "stale"},
+	}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	result, err := New(cfg, logger, singleFindingSnapshot(finding), linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-01-31" {
+		t.Fatalf("upgrade: updated %+v, want one update to the earlier date 2026-01-31", linear.updated)
+	}
+	if result.HeldDueDates != 0 || strings.Contains(logs.String(), "cold-start") {
+		t.Fatalf("upgrade: HeldDueDates = %d, logs:\n%s", result.HeldDueDates, logs.String())
+	}
+	if _, ok := store.meta[acceptancesColdStartMetaKey]; ok {
+		t.Fatalf("upgrade: marker set: %v", store.meta)
+	}
+	if state := store.meta[cache.AcceptanceMemoryStateKey]; state != cache.AcceptanceMemoryTrusted {
+		t.Fatalf("upgrade: memory state = %q, want trusted", state)
 	}
 }
 

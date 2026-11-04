@@ -21,12 +21,20 @@ type AcceptanceMemoryStore interface {
 	GetMeta(context.Context, string) (string, bool, error)
 	SetMeta(context.Context, string, string) error
 	HasAcceptanceRows(context.Context) (bool, error)
+	HasPriorRunData(context.Context) (bool, error)
 }
 
 // PrepareAcceptanceMemory records whether the acceptance memory began empty
 // and reports it. The pending state persists across failed loads, including
 // diagnostic loads that populate the memory outside Service.Run, until a
 // successful run or an operator marks the memory trusted.
+//
+// An empty memory is pending only in a cache that holds nothing from a
+// previous run: a new or lost cache file, where any remembered expiry is
+// gone. A cache a previous run wrote but that has no acceptance rows is an
+// upgrade from a version without the memory: nothing was lost, since there
+// was never anything remembered, so the memory is trusted from the start
+// and the cold-start guard has nothing to hold.
 func PrepareAcceptanceMemory(ctx context.Context, store AcceptanceMemoryStore) (pending bool, err error) {
 	state, ok, err := store.GetMeta(ctx, AcceptanceMemoryStateKey)
 	if err != nil {
@@ -38,6 +46,12 @@ func PrepareAcceptanceMemory(ctx context.Context, store AcceptanceMemoryStore) (
 	present, err := store.HasAcceptanceRows(ctx)
 	if err != nil {
 		return false, err
+	}
+	if !present {
+		present, err = store.HasPriorRunData(ctx)
+		if err != nil {
+			return false, err
+		}
 	}
 	state = AcceptanceMemoryTrusted
 	if !present {

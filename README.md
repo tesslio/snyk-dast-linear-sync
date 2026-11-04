@@ -488,9 +488,8 @@ DAST reported, not anything the sync wrote.
 
 ### Cold-start guard
 
-A run that starts with an empty acceptance memory (a new or lost cache file,
-or the first run of a version that has one) while Linear already holds open
-tickets with due dates cannot tell an earlier due date that is a real change
+A run that starts with an empty acceptance memory in a new or lost cache file
+while Linear already holds open tickets with due dates cannot tell an earlier due date that is a real change
 from one that only reflects an expiry it no longer remembers. Such a run keeps
 the current due date of any matched open ticket whose desired date is earlier,
 logs a warning with the count (`held_due_dates` in the summary), and leaves an
@@ -512,6 +511,12 @@ The clear flag records that the memory is trusted and removes the cold-start
 marker. This release persists even when there are no acceptances to remember,
 so the next normal run stays released. Deleting only `acceptances_cold_start_at`
 does not release pending memory; use the flag.
+
+Upgrading from a version without the memory does not engage the guard: a
+cache a previous run wrote (it holds the schema signature and hash rows) but
+that has no acceptance rows never remembered an expiry, so none was lost, and
+the memory is marked trusted from the start. Only a cache with no prior run
+data (a new file, or an Actions cache miss) is treated as a cold start.
 
 The memory can only remember what it has seen. A ticket whose due date had
 already regressed before this memory existed is corrected the next time Snyk

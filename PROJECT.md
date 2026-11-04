@@ -463,11 +463,15 @@ removes the marker. Trust persists even when the table stays empty, including
 on subsequent normal runs. Deleting only the guard key does not release
 pending memory; use the flag.
 
-The first run of a version with the memory engages the guard whenever Linear
-already holds open dated tickets. Tickets whose due dates had already
-regressed to `created_at` plus the offset are not moved earlier by it, and
-are not moved later either until Snyk DAST reports the acceptance again: the
-memory can only remember what it has seen.
+The guard is for a lost memory, not a new one. A cache a previous run wrote
+(the snapshot save records the schema signature and the hash rows on every
+successful run) but that has no acceptance rows is an upgrade from a version
+without the memory: no expiry was ever remembered, so none was lost, the
+memory is marked trusted from the start and earlier due dates are written as
+usual. Only a cache with no prior run data (a new file, or an Actions cache
+miss) records a pending start. Either way the memory can only remember what
+it has seen: a ticket whose due date had already regressed is not moved later
+until Snyk DAST reports the acceptance again.
 
 ## Safety Assumptions
 

@@ -54,6 +54,10 @@ func (m *memoryStore) HasAcceptanceRows(context.Context) (bool, error) {
 	return len(m.rows) > 0, nil
 }
 
+func (m *memoryStore) HasPriorRunData(context.Context) (bool, error) {
+	return false, nil
+}
+
 func (m *memoryStore) LoadAcceptances(context.Context) (map[string]cache.AcceptanceMeta, error) {
 	if m.loadErr != nil {
 		return nil, m.loadErr

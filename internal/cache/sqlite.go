@@ -301,6 +301,38 @@ func (s *Store) HasAcceptanceRows(ctx context.Context) (bool, error) {
 	return present, nil
 }
 
+// HasPriorRunData reports whether the cache was written by a previous
+// successful run: Save records the schema signature and the hash rows on
+// every one. It tells an upgraded cache (the acceptance table is new and
+// empty, but nothing was lost) from a brand-new or lost cache file, which
+// is the case the cold-start guard exists for. The schema_version key does
+// not count: Open writes it before any run.
+func (s *Store) HasPriorRunData(ctx context.Context) (bool, error) {
+	if _, ok, err := s.GetMeta(ctx, "schema_signature"); err != nil || ok {
+		return ok, err
+	}
+	for _, table := range []string{"snyk_dast_findings", "linear_issues"} {
+		query, args, err := s.builder.Select("1").From(table).Limit(1).ToSql()
+		if err != nil {
+			return false, fmt.Errorf("build cache %s presence query: %w", table, err)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return false, fmt.Errorf("check cache %s presence: %w", table, err)
+		}
+		present := rows.Next()
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return false, fmt.Errorf("check cache %s presence: %w", table, err)
+		}
+		if present {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // GetMeta returns the value stored under a sync_meta key, and whether the
 // key exists.
 func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
