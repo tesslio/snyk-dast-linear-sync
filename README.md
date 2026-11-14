@@ -119,6 +119,7 @@ CI enforces this: the `go fix` check runs `go fix ./...` and then
 - Includes target, vulnerable URL, HTTP method, path, parameter, insertion point, CWE, and CVSS details when Snyk DAST provides them.
 - Batches Linear create and update mutations to reduce request pressure.
 - Retries and backs off on Linear rate limiting.
+- Honors an explicit `Retry-After: 0` without substituting the default backoff.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn.
 
 ## Snyk DAST (Probely) API Permissions
