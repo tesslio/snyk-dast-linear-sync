@@ -298,7 +298,10 @@ cause daily cache churn.
 
 ## Performance Model
 
-The HTTP transport honors a zero-second `Retry-After` as an immediate retry.
+The HTTP transport treats a zero-second `Retry-After` as zero delay for that
+header, instead of substituting the default backoff. Request-limit headers
+and shared rate-limit windows retain precedence and can still delay dispatch,
+including the fallback delay when a request-limit reset is absent or invalid.
 It closes request bodies it retains ownership of, including the original body
 when replayable copies are sent and bodies cancelled before dispatch. Bodies
 handed to the underlying transport remain that transport's responsibility.
